@@ -1,6 +1,6 @@
-# Open Permafrost Monitor — GNSS bring-up
+# Open Permafrost Monitor — RTK GNSS field logger
 
-Step 1: confirm the ESP32 can read NMEA data from the ZED-F9P (gnss.store ELT0128) and get a basic fix, before adding RTK corrections.
+ESP32 + u-blox ZED-F9P (gnss.store ELT0128) RTK rover. Wakes on a configurable interval, connects to WiFi, pulls RTCM corrections from an NTRIP caster, waits for a fix meeting a configurable accuracy threshold, publishes the position over MQTTS, then deep-sleeps until the next cycle.
 
 ## Hardware
 
@@ -17,7 +17,67 @@ Step 1: confirm the ESP32 can read NMEA data from the ZED-F9P (gnss.store ELT012
 | VCC (3.3V) | 3.3V        |
 | GND        | GND         |
 
-Both boards are 3.3V logic, so no level shifter is needed. Do not power the F9P from 5V.
+Both boards are 3.3V logic, so no level shifter is needed. Do not power the F9P from 5V. All pin assignments live in one place: [include/pins.h](include/pins.h).
+
+## Code layout
+
+| File | Responsibility |
+|------|-----------------|
+| [include/pins.h](include/pins.h) | All GPIO/UART pin assignments |
+| [include/device_config.h](include/device_config.h) / [src/device_config.cpp](src/device_config.cpp) | Field-configurable settings, persisted in NVS flash |
+| [include/config_portal.h](include/config_portal.h) / [src/config_portal.cpp](src/config_portal.cpp) | WiFi AP + captive web portal for field setup |
+| [include/gnss.h](include/gnss.h) / [src/gnss.cpp](src/gnss.cpp) | ZED-F9P UART, NMEA parsing, fix quality/accuracy |
+| [include/ntrip_client.h](include/ntrip_client.h) / [src/ntrip_client.cpp](src/ntrip_client.cpp) | NTRIP caster connection, RTCM forwarding |
+| [include/mqtt_client.h](include/mqtt_client.h) / [src/mqtt_client.cpp](src/mqtt_client.cpp) | MQTTS publish |
+| [include/isrg_root_x1.h](include/isrg_root_x1.h) | Let's Encrypt root CA, for validating the MQTT broker's TLS cert |
+| [src/main.cpp](src/main.cpp) | Orchestrates one wake→measure→publish→sleep cycle |
+| [include/secrets.h](include/secrets.h) (git-ignored, copy from `secrets.h.example`) | Compiled-in **seed defaults** loaded into NVS on first boot only |
+
+## Field setup (no reflashing needed)
+
+On every **power-on or reset** (not on a timer wake from deep sleep), the device opens a WiFi hotspot for 5 minutes:
+
+1. Connect your phone/laptop to the WiFi network **"PermafrostMonitor-Setup"**.
+2. Browse to `192.168.4.1`.
+3. Set the WiFi network the device should use in the field, plus:
+   - MQTT host/port/client ID/username(token)/password/topic
+   - NTRIP caster host/port/mountpoint/username/password
+   - **Measurement interval** — how often to wake, measure, and publish (seconds)
+   - **Max wait for a good fix** — give up and publish best-effort after this long (seconds)
+   - **Good fix horizontal accuracy** — threshold in meters (e.g. `0.05` for 5 cm) to consider a fix "good enough"
+4. Submit. Settings are saved to flash (NVS) and used from then on, surviving reboots and reflashes.
+
+If nobody connects within 5 minutes, the device proceeds with whatever was last saved (or the compiled-in defaults from `secrets.h` on a brand-new device).
+
+## Low-power measurement cycle
+
+Each wake:
+
+1. Connect WiFi (using credentials saved via the portal).
+2. Connect to the NTRIP caster and start forwarding RTCM3 corrections into the F9P.
+3. Poll the GNSS until horizontal accuracy (from the receiver's own GST error estimate) is at or below the configured threshold, or until the configured timeout elapses — whichever comes first.
+4. Connect to the MQTT broker over TLS (cert validated against Let's Encrypt's root) and publish the position.
+5. Disconnect everything and deep-sleep for the configured measurement interval. On wake, execution restarts from the top (no state is kept in RAM) — the portal is skipped because the wake reason is a timer, not a power-on/reset.
+
+## MQTT payload
+
+Published as JSON to the configured topic. Position fields follow CF (Climate and Forecast) convention naming:
+
+```json
+{
+  "time": "2026-07-14T12:34:56Z",
+  "latitude": 78.2232012,
+  "longitude": 15.6512034,
+  "altitude": 12.34,
+  "fix_quality": 4,
+  "satellites": 22,
+  "horizontal_accuracy": 0.031,
+  "vertical_accuracy": 0.048,
+  "quality_ok": true
+}
+```
+
+`fix_quality` follows the standard NMEA GGA fix indicator (0=no fix, 1=autonomous, 2=DGPS, 4=RTK fixed, 5=RTK float). `quality_ok` reflects whether `horizontal_accuracy` met the configured threshold before the wait timed out.
 
 ## Build & flash
 
@@ -28,14 +88,8 @@ pio device monitor
 
 (or open this folder in the PlatformIO VS Code extension and use the Upload / Monitor buttons)
 
-## What to expect
+## Notes
 
-- Raw NMEA sentences ($GNGGA, $GNRMC, etc.) printed as they arrive.
-- A "Fix summary" block once per second: fix validity, satellite count, HDOP, lat/lng, altitude.
-- Outdoors with sky view, a basic (non-RTK) fix typically appears within 30-60s cold start.
-
-If nothing appears in the monitor after ~15s, the firmware prints a warning — try changing `GPS_BAUD` in [src/main.cpp](src/main.cpp) to 9600 or 115200 (some F9P boards arrive pre-configured to a different rate than the factory default 38400).
-
-## Next step
-
-Once a basic (standalone) fix is confirmed, the next step is adding an NTRIP client to push RTCM correction data into the F9P's UART for RTK fix mode.
+- `WiFi.setSleep(false)` is set on every connect to avoid ESP32's modem-sleep power-save mode, which otherwise drops the WiFi association roughly every 30-60s.
+- The Arduino loop-task stack is raised to 16KB (`SET_LOOP_TASK_STACK_SIZE`) because the default 8KB is too small for a TLS handshake and crashes with a stack overflow.
+- `secrets.h` is git-ignored; only `secrets.h.example` (with placeholder values) is committed.
