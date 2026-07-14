@@ -1,8 +1,16 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 #include <TinyGPSPlus.h>
 #include "secrets.h"
+#include "isrg_root_x1.h"
+
+// The default 8KB Arduino loop-task stack is too small for a TLS handshake
+// (WiFiClientSecure/mbedTLS) and crashes with a stack overflow at connect time.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // ZED-F9P (gnss.store ELT0128) wired to ESP32 UART2.
 // SEL jumper left unsoldered -> module's UART1 is the active serial interface.
@@ -27,10 +35,16 @@ const unsigned long GGA_SEND_INTERVAL_MS = 10000;
 
 const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 const unsigned long NTRIP_RETRY_INTERVAL_MS = 5000;
+const unsigned long MQTT_RETRY_INTERVAL_MS = 5000;
+
+// How often to publish a position (with a fix) to the MQTT broker.
+const unsigned long MQTT_PUBLISH_INTERVAL_MS = 5000;
 
 HardwareSerial GPSSerial(2);
 TinyGPSPlus gps;
 WiFiClient ntripClient;
+WiFiClientSecure mqttNetClient;
+PubSubClient mqttClient(mqttNetClient);
 
 // GST (GNSS Pseudorange error statistics) carries the receiver's own 1-sigma
 // position error estimate in meters - a real accuracy figure, not just HDOP.
@@ -61,6 +75,8 @@ const unsigned long SUMMARY_INTERVAL_MS = 1000;
 unsigned long lastWifiAttemptMs = 0;
 unsigned long lastNtripAttemptMs = 0;
 unsigned long lastGgaSentMs = 0;
+unsigned long lastMqttAttemptMs = 0;
+unsigned long lastMqttPublishMs = 0;
 unsigned long rtcmBytesForwarded = 0;
 
 // Raw GGA line last seen from the F9P itself, forwarded to the caster as-is
@@ -105,6 +121,9 @@ String base64Encode(const String &input) {
 void connectWiFi() {
   Serial.printf("Connecting to WiFi \"%s\"...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  // ESP32 WiFi power-save (modem sleep) periodically drops the association
+  // (typically every ~30-60s) to save power - disable it for a stable link.
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();
@@ -179,6 +198,76 @@ void sendGgaToCaster() {
   ntripClient.print("\r\n");
 }
 
+bool connectMqtt() {
+  Serial.printf("Connecting to MQTT broker %s:%d ...\n", MQTT_HOST, MQTT_PORT);
+
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+
+  bool ok;
+  if (strlen(MQTT_USER) > 0) {
+    ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD);
+  } else {
+    ok = mqttClient.connect(MQTT_CLIENT_ID);
+  }
+
+  if (!ok) {
+    Serial.printf("MQTT connect failed, state=%d\n", mqttClient.state());
+    char tlsErr[128];
+    mqttNetClient.lastError(tlsErr, sizeof(tlsErr));
+    if (tlsErr[0] != '\0') {
+      Serial.print(F("TLS error: "));
+      Serial.println(tlsErr);
+    }
+    return false;
+  }
+
+  Serial.println(F("MQTT connected."));
+  return true;
+}
+
+void publishFix() {
+  if (!mqttClient.connected() || !gps.location.isValid()) {
+    return;
+  }
+
+  JsonDocument doc;
+
+  if (gps.date.isValid() && gps.time.isValid()) {
+    char timestamp[25];
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             gps.date.year(), gps.date.month(), gps.date.day(),
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+    doc["timestamp"] = timestamp;
+  }
+
+  if (ggaFixQuality.isValid()) {
+    doc["fix_quality"] = atoi(ggaFixQuality.value());
+  }
+  doc["satellites"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  doc["lat"] = gps.location.lat();
+  doc["lon"] = gps.location.lng();
+  if (gps.altitude.isValid()) {
+    doc["alt_m"] = gps.altitude.meters();
+  }
+
+  if (gstStdLat.isValid()) {
+    float latErr = atof(gstStdLat.value());
+    float lonErr = atof(gstStdLon.value());
+    float altErr = atof(gstStdAlt.value());
+    doc["horizontal_error_m"] = sqrt(latErr * latErr + lonErr * lonErr);
+    doc["vertical_error_m"] = altErr;
+  }
+
+  char payload[512];
+  size_t len = serializeJson(doc, payload);
+
+  if (mqttClient.publish(MQTT_TOPIC, (const uint8_t *)payload, len)) {
+    Serial.println(F("Published position to MQTT."));
+  } else {
+    Serial.println(F("MQTT publish failed."));
+  }
+}
+
 void printFixSummary() {
   Serial.println(F("---- Fix summary ----"));
 
@@ -232,6 +321,8 @@ void printFixSummary() {
   Serial.println(ntripClient.connected() ? F("connected") : F("disconnected"));
   Serial.print(F("RTCM bytes forwarded: "));
   Serial.println(rtcmBytesForwarded);
+  Serial.print(F("MQTT: "));
+  Serial.println(mqttClient.connected() ? F("connected") : F("disconnected"));
 
   Serial.println();
 }
@@ -252,6 +343,8 @@ void setup() {
   delay(100);
   Serial.println(F("Enabling GST (position error) sentence on the F9P..."));
   GPSSerial.write(UBX_ENABLE_GST_UART1, sizeof(UBX_ENABLE_GST_UART1));
+
+  mqttNetClient.setCACert(ISRG_ROOT_X1_CA);
 
   connectWiFi();
 }
@@ -301,6 +394,18 @@ void loop() {
     sendGgaToCaster();
   }
 #endif
+
+  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected() &&
+      now - lastMqttAttemptMs >= MQTT_RETRY_INTERVAL_MS) {
+    lastMqttAttemptMs = now;
+    connectMqtt();
+  }
+  mqttClient.loop();
+
+  if (now - lastMqttPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
+    lastMqttPublishMs = now;
+    publishFix();
+  }
 
   if (now - lastSummaryMs >= SUMMARY_INTERVAL_MS) {
     lastSummaryMs = now;
