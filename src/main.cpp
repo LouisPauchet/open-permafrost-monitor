@@ -17,6 +17,15 @@ static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 
 static bool connectWiFiSTA() {
+  // The config portal (if it ran this boot) already connects WiFi - calling
+  // WiFi.begin() again here would restart the association and race with
+  // DHCP, briefly leaving WiFi.status() == WL_CONNECTED with IP 0.0.0.0.
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F("WiFi already connected, IP: "));
+    Serial.println(WiFi.localIP());
+    return true;
+  }
+
   WiFi.mode(WIFI_STA);
   // ESP32 WiFi power-save (modem sleep) periodically drops the association
   // (typically every ~30-60s) to save power - disable it for a stable link.
