@@ -10,3 +10,9 @@
 #define GPS_RX_PIN 16
 #define GPS_TX_PIN 17
 #define GPS_BAUD 38400
+
+// SD card logging (raw GNSS data for later PPK/PPP post-processing).
+// Hardware not yet on hand - uncomment and set once the SD reader module
+// and its wiring are chosen. Standard SPI wiring: MOSI/MISO/SCK use the
+// ESP32's default VSPI pins (23/19/18); only CS needs to be picked.
+// #define SD_CS_PIN 5

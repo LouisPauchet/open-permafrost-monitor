@@ -30,14 +30,15 @@ Both boards are 3.3V logic, so no level shifter is needed. Do not power the F9P 
 | [include/ntrip_client.h](include/ntrip_client.h) / [src/ntrip_client.cpp](src/ntrip_client.cpp) | NTRIP caster connection, RTCM forwarding |
 | [include/mqtt_client.h](include/mqtt_client.h) / [src/mqtt_client.cpp](src/mqtt_client.cpp) | MQTTS publish |
 | [include/isrg_root_x1.h](include/isrg_root_x1.h) | Let's Encrypt root CA, for validating the MQTT broker's TLS cert |
+| [include/sd_logger.h](include/sd_logger.h) / [src/sd_logger.cpp](src/sd_logger.cpp) | Raw GNSS logging to SD for later PPK/PPP post-processing (pending SD reader hardware) |
 | [src/main.cpp](src/main.cpp) | Orchestrates one wake→measure→publish→sleep cycle |
 | [include/secrets.h](include/secrets.h) (git-ignored, copy from `secrets.h.example`) | Compiled-in **seed defaults** loaded into NVS on first boot only |
 
 ## Field setup (no reflashing needed)
 
-On every **power-on or reset** (not on a timer wake from deep sleep), the device opens a WiFi hotspot for 5 minutes:
+On every **power-on or reset** (not on a timer wake from deep sleep), the device opens a WiFi hotspot for 5 minutes, named **"PermafrostMonitor-XXXXXX"** where `XXXXXX` is the last 3 bytes of that unit's ESP32 MAC address — so each physical device in the field has a distinguishable network name when several are deployed at once.
 
-1. Connect your phone/laptop to the WiFi network **"PermafrostMonitor-Setup"**.
+1. Connect your phone/laptop to that WiFi network.
 2. Browse to `192.168.4.1`.
 3. Set the WiFi network the device should use in the field, plus:
    - MQTT host/port/client ID/username(token)/password/topic
@@ -78,6 +79,16 @@ Published as JSON to the configured topic. Position fields follow CF (Climate an
 ```
 
 `fix_quality` follows the standard NMEA GGA fix indicator (0=no fix, 1=autonomous, 2=DGPS, 4=RTK fixed, 5=RTK float). `quality_ok` reflects whether `horizontal_accuracy` met the configured threshold before the wait timed out.
+
+## Post-processing (PPK/PPP) — SD card logging
+
+Not yet wired up (SD reader hardware pending), but scaffolded so it activates without further code changes once it arrives:
+
+1. Uncomment and set `SD_CS_PIN` in [include/pins.h](include/pins.h) to match your reader's wiring (standard SPI: MOSI/MISO/SCK are the ESP32's default VSPI pins 23/19/18, only CS varies by board).
+2. On the next boot, `initSDLogger()` will detect the card, open a new log file (`/gnss_NNNNNN.ubx`, an incrementing counter stored in RTC memory), and `gnss.cpp` will both enable `RXM-RAWX`/`RXM-SFRBX` raw measurement output on the F9P and write every raw byte from its UART (NMEA + UBX) straight to that file.
+3. Those `.ubx` log files can be fed into RTKLIB (`convbin`) or u-center to convert to RINEX and post-process against a base station's raw data (or precise products) for accuracy beyond what a live RTK float/fixed solution reached — useful for cycles where `quality_ok` came back `false`.
+
+If `SD_CS_PIN` is left undefined (the current state), all of this is a complete no-op — no behavior change, no wasted cycles.
 
 ## Build & flash
 

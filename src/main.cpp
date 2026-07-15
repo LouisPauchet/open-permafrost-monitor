@@ -8,6 +8,7 @@
 #include "gnss.h"
 #include "ntrip_client.h"
 #include "mqtt_client.h"
+#include "sd_logger.h"
 
 // The default 8KB Arduino loop-task stack is too small for a TLS handshake
 // (WiFiClientSecure/mbedTLS) and crashes with a stack overflow at connect time.
@@ -61,6 +62,7 @@ void setup() {
   Serial.println(F("ESP32 <-> ZED-F9P RTK permafrost monitor"));
 
   loadDeviceConfig();
+  initSDLogger(); // no-op today (no reader wired up yet); ready once it is
   initGNSS();
 
   esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
@@ -122,6 +124,7 @@ void setup() {
 
   ntripDisconnect();
   WiFi.disconnect(true);
+  closeSDLogger();
 
   goToSleep();
 }

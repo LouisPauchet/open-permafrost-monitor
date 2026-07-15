@@ -1,5 +1,6 @@
 #include "gnss.h"
 #include "pins.h"
+#include "sd_logger.h"
 #include <TinyGPSPlus.h>
 #include <string.h>
 #include <stdlib.h>
@@ -32,6 +33,22 @@ static const uint8_t UBX_ENABLE_GST_UART1[] = {
   0x07, 0x59              // checksum (CK_A, CK_B)
 };
 
+// UBX-CFG-MSG: enable RXM-RAWX (class 0x02, id 0x15) and RXM-SFRBX
+// (class 0x02, id 0x13) on UART1 - raw pseudorange/carrier-phase and
+// broadcast navigation data, needed for PPK/PPP post-processing. Only sent
+// when SD logging is actually available, so nothing changes on the F9P
+// until the SD reader is wired up.
+static const uint8_t UBX_ENABLE_RAWX_UART1[] = {
+  0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+  0x02, 0x15, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+  0x27, 0x4B
+};
+static const uint8_t UBX_ENABLE_SFRBX_UART1[] = {
+  0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+  0x02, 0x13, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+  0x25, 0x3D
+};
+
 // Raw GGA line last seen from the F9P itself, relayed to the NTRIP caster
 // as-is (correct format/precision/checksum guaranteed since the module made it).
 static char lastGGA[100] = "";
@@ -45,11 +62,17 @@ void initGNSS() {
 
   delay(100);
   GPSSerial.write(UBX_ENABLE_GST_UART1, sizeof(UBX_ENABLE_GST_UART1));
+
+  if (sdLoggerAvailable()) {
+    GPSSerial.write(UBX_ENABLE_RAWX_UART1, sizeof(UBX_ENABLE_RAWX_UART1));
+    GPSSerial.write(UBX_ENABLE_SFRBX_UART1, sizeof(UBX_ENABLE_SFRBX_UART1));
+  }
 }
 
 void pollGNSS() {
   while (GPSSerial.available() > 0) {
     char c = GPSSerial.read();
+    sdLogRawByte((uint8_t)c);
     gps.encode(c);
 
     if (c == '\n') {

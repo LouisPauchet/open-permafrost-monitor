@@ -1,10 +1,10 @@
 #include "config_portal.h"
 #include "device_config.h"
+#include <WiFi.h>
 #include <WiFiManager.h>
 #include <stdlib.h>
 #include <string.h>
 
-static const char *AP_NAME = "PermafrostMonitor-Setup";
 static const uint16_t CONFIG_PORTAL_TIMEOUT_S = 300; // 5 minutes
 
 static bool configSaved = false;
@@ -17,8 +17,19 @@ static void copyField(char *dst, size_t dstSize, const char *src) {
   dst[dstSize - 1] = '\0';
 }
 
+// "PermafrostMonitor-AABBCC" using the last 3 bytes of the ESP32's factory
+// MAC, so each physical unit gets a distinguishable hotspot name in the field.
+static String buildApName() {
+  WiFi.mode(WIFI_STA); // ensures a valid MAC is readable
+  String mac = WiFi.macAddress(); // "AA:BB:CC:DD:EE:FF"
+  mac.replace(":", "");
+  String suffix = mac.substring(mac.length() - 6);
+  return String("PermafrostMonitor-") + suffix;
+}
+
 void runConfigPortal() {
   configSaved = false;
+  String apName = buildApName();
   WiFiManager wm;
 
   char port_buf[8];
@@ -68,8 +79,8 @@ void runConfigPortal() {
   wm.setConfigPortalTimeout(CONFIG_PORTAL_TIMEOUT_S);
 
   Serial.printf("Setup portal open for %u s - connect to WiFi \"%s\" and browse to 192.168.4.1\n",
-                CONFIG_PORTAL_TIMEOUT_S, AP_NAME);
-  wm.startConfigPortal(AP_NAME);
+                CONFIG_PORTAL_TIMEOUT_S, apName.c_str());
+  wm.startConfigPortal(apName.c_str());
 
   if (configSaved) {
     copyField(deviceConfig.mqtt_host, sizeof(deviceConfig.mqtt_host), p_mqtt_host.getValue());
