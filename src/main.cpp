@@ -16,6 +16,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
+static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
 
 static bool connectWiFiSTA() {
   // The config portal (if it ran this boot) already connects WiFi - calling
@@ -63,6 +64,12 @@ void setup() {
 
   loadDeviceConfig();
   initSDLogger(); // no-op today (no reader wired up yet); ready once it is
+
+  // Wake the F9P from UBX-RXM-PMREQ backup mode (harmless if it wasn't
+  // asleep, e.g. the very first boot ever) and give it a moment to come
+  // back up before talking to it over UART.
+  gnssWakeup();
+  delay(500);
   initGNSS();
 
   esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
@@ -76,6 +83,7 @@ void setup() {
   }
 
   if (!connectWiFiSTA()) {
+    gnssSleep();
     goToSleep();
     return;
   }
@@ -87,6 +95,7 @@ void setup() {
 
   unsigned long fixWaitStart = millis();
   unsigned long lastGgaSent = 0;
+  unsigned long lastGstEnableRetry = 0;
   bool qualityOk = false;
 
   while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL) {
@@ -102,12 +111,24 @@ void setup() {
       }
     }
 
+    // The GST-enable command sent in initGNSS() can land before the F9P is
+    // ready to process it, especially right after an EXTINT wake from
+    // backup mode - keep retrying until GST sentences are actually flowing.
+    if (!gnssHasAccuracyEstimate() && millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
+      lastGstEnableRetry = millis();
+      gnssEnableGST();
+    }
+
     if (gnssHasFix() && gnssHasAccuracyEstimate() && gnssHorizontalAccuracy() <= deviceConfig.good_accuracy_m) {
       qualityOk = true;
       break;
     }
 
     delay(20);
+  }
+
+  if (gnssCharsProcessed() < 10) {
+    Serial.println(F("WARNING: no GNSS data received this cycle - check wiring, or EXTINT wake polarity/timing."));
   }
 
   Serial.print(F("Fix quality: "));
@@ -125,6 +146,7 @@ void setup() {
   ntripDisconnect();
   WiFi.disconnect(true);
   closeSDLogger();
+  gnssSleep();
 
   goToSleep();
 }

@@ -49,6 +49,24 @@ static const uint8_t UBX_ENABLE_SFRBX_UART1[] = {
   0x25, 0x3D
 };
 
+// UBX-RXM-PMREQ (class 0x02, id 0x41), 16-byte payload version, requesting
+// indefinite backup mode (duration=0), force+backup flags (0x06 - enters
+// backup even with USB attached, so bring-up over USB serial behaves the
+// same as field/battery operation), waking on EXTINT0 or UART RX activity
+// (whichever fires first - UART RX is a bring-up safety net in case EXTINT
+// wiring/polarity needs adjustment). Byte layout and wakeupSources bit
+// values (EXTINT0=0x20, UARTRX=0x08) verified against SparkFun's u-blox
+// GNSS Arduino library (src/SparkFun_u-blox_GNSS_Arduino_Library.cpp,
+// powerOffWithInterrupt()), checksum computed by hand.
+static const uint8_t UBX_PMREQ_BACKUP_EXTINT_UARTRX[] = {
+  0xB5, 0x62, 0x02, 0x41, 0x10, 0x00,
+  0x00, 0x00, 0x00, 0x00,             // version, reserved
+  0x00, 0x00, 0x00, 0x00,             // duration = 0 (indefinite)
+  0x06, 0x00, 0x00, 0x00,             // flags: force | backup
+  0x28, 0x00, 0x00, 0x00,             // wakeupSources: EXTINT0 | UARTRX
+  0x81, 0xEB                          // checksum (CK_A, CK_B)
+};
+
 // Raw GGA line last seen from the F9P itself, relayed to the NTRIP caster
 // as-is (correct format/precision/checksum guaranteed since the module made it).
 static char lastGGA[100] = "";
@@ -56,17 +74,37 @@ static bool haveGGA = false;
 static char lineBuf[100];
 static uint8_t lineLen = 0;
 
+void gnssEnableGST() {
+  GPSSerial.write(UBX_ENABLE_GST_UART1, sizeof(UBX_ENABLE_GST_UART1));
+}
+
 void initGNSS() {
   GPSSerial.setRxBufferSize(1024);
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   delay(100);
-  GPSSerial.write(UBX_ENABLE_GST_UART1, sizeof(UBX_ENABLE_GST_UART1));
+  gnssEnableGST();
 
   if (sdLoggerAvailable()) {
     GPSSerial.write(UBX_ENABLE_RAWX_UART1, sizeof(UBX_ENABLE_RAWX_UART1));
     GPSSerial.write(UBX_ENABLE_SFRBX_UART1, sizeof(UBX_ENABLE_SFRBX_UART1));
   }
+}
+
+void gnssSleep() {
+  GPSSerial.write(UBX_PMREQ_BACKUP_EXTINT_UARTRX, sizeof(UBX_PMREQ_BACKUP_EXTINT_UARTRX));
+  GPSSerial.flush();
+}
+
+void gnssWakeup() {
+  // Wake trigger is an edge on EXTINT (u-blox docs/reference drivers note
+  // it can be a falling or rising edge) - drive both to not depend on which.
+  pinMode(GPS_EXTINT_PIN, OUTPUT);
+  digitalWrite(GPS_EXTINT_PIN, LOW);
+  delay(10);
+  digitalWrite(GPS_EXTINT_PIN, HIGH);
+  delay(10);
+  digitalWrite(GPS_EXTINT_PIN, LOW);
 }
 
 void pollGNSS() {

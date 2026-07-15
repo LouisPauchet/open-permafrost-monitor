@@ -11,6 +11,10 @@
 #define GPS_TX_PIN 17
 #define GPS_BAUD 38400
 
+// F9P EXTINT pin -> ESP32, used to wake the receiver from UBX-RXM-PMREQ
+// backup mode (software sleep, see gnss.h: gnssSleep()/gnssWakeup()).
+#define GPS_EXTINT_PIN 4
+
 // SD card logging (raw GNSS data for later PPK/PPP post-processing).
 // Hardware not yet on hand - uncomment and set once the SD reader module
 // and its wiring are chosen. Standard SPI wiring: MOSI/MISO/SCK use the

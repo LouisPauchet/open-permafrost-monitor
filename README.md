@@ -14,6 +14,7 @@ ESP32 + u-blox ZED-F9P (gnss.store ELT0128) RTK rover. Wakes on a configurable i
 |------------|-------------|
 | UART1 TXO  | GPIO16 (RX2)|
 | UART1 RXI  | GPIO17 (TX2)|
+| EXTINT     | GPIO4       |
 | VCC (3.3V) | 3.3V        |
 | GND        | GND         |
 
@@ -54,11 +55,14 @@ If nobody connects within 5 minutes, the device proceeds with whatever was last 
 
 Each wake:
 
-1. Connect WiFi (using credentials saved via the portal).
-2. Connect to the NTRIP caster and start forwarding RTCM3 corrections into the F9P.
-3. Poll the GNSS until horizontal accuracy (from the receiver's own GST error estimate) is at or below the configured threshold, or until the configured timeout elapses — whichever comes first.
-4. Connect to the MQTT broker over TLS (cert validated against Let's Encrypt's root) and publish the position.
-5. Disconnect everything and deep-sleep for the configured measurement interval. On wake, execution restarts from the top (no state is kept in RAM) — the portal is skipped because the wake reason is a timer, not a power-on/reset.
+1. Pulse the F9P's EXTINT pin to wake it from `UBX-RXM-PMREQ` backup mode (harmless no-op if it wasn't asleep, e.g. the very first boot), then give it a moment to come back up.
+2. Connect WiFi (using credentials saved via the portal).
+3. Connect to the NTRIP caster and start forwarding RTCM3 corrections into the F9P.
+4. Poll the GNSS until horizontal accuracy (from the receiver's own GST error estimate) is at or below the configured threshold, or until the configured timeout elapses — whichever comes first.
+5. Connect to the MQTT broker over TLS (cert validated against Let's Encrypt's root) and publish the position.
+6. Send the F9P back into `UBX-RXM-PMREQ` backup mode, disconnect everything else, and deep-sleep for the configured measurement interval. On wake, execution restarts from the top (no state is kept in RAM) — the portal is skipped because the wake reason is a timer, not a power-on/reset.
+
+The F9P draws 100+ mA continuously when active, dwarfing the ESP32's own ~10µA deep-sleep current, so putting it to sleep too (rather than leaving it powered/active the whole interval) is what makes the low-power cycle actually low-power. Backup mode preserves the receiver's RTC/ephemeris, so reacquisition on wake is a fast warm start rather than a full cold start. See [include/gnss.h](include/gnss.h) (`gnssSleep()`/`gnssWakeup()`) for the implementation — the wake source is configured as EXTINT0 **or** UART RX activity, so even if the EXTINT wiring/polarity needs adjustment, sending any byte on the existing UART TX line still recovers the module.
 
 ## MQTT payload
 
