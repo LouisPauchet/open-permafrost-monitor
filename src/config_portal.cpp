@@ -83,6 +83,24 @@ void runConfigPortal() {
   wm.startConfigPortal(apName.c_str());
 
   if (configSaved) {
+    // Guard against persisting an obviously-blank submission (e.g. a phone's
+    // automatic captive-portal-detection probe hitting the save endpoint, or
+    // a page load before fields were pre-filled) - that would otherwise
+    // silently wipe a previously-working configuration with empty/zero
+    // values. Require the two hostnames and the numeric fields to be
+    // non-empty/non-zero before accepting the submission.
+    bool looksValid = strlen(p_mqtt_host.getValue()) > 0 &&
+                       strlen(p_ntrip_host.getValue()) > 0 &&
+                       atoi(p_mqtt_port.getValue()) > 0 &&
+                       atoi(p_ntrip_port.getValue()) > 0 &&
+                       strtoul(p_interval.getValue(), nullptr, 10) > 0 &&
+                       strtoul(p_timeout.getValue(), nullptr, 10) > 0;
+
+    if (!looksValid) {
+      Serial.println(F("Setup portal submission looked blank/invalid (host or numeric field empty/zero) - ignoring it, keeping existing config."));
+      return;
+    }
+
     copyField(deviceConfig.mqtt_host, sizeof(deviceConfig.mqtt_host), p_mqtt_host.getValue());
     deviceConfig.mqtt_port = (uint16_t)atoi(p_mqtt_port.getValue());
     copyField(deviceConfig.mqtt_client_id, sizeof(deviceConfig.mqtt_client_id), p_mqtt_cid.getValue());

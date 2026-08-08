@@ -37,22 +37,39 @@ void loadDeviceConfig() {
   bool hasSavedConfig = prefs.isKey("mqtt_host");
 
   if (hasSavedConfig) {
-    prefs.getString("mqtt_host", deviceConfig.mqtt_host, sizeof(deviceConfig.mqtt_host));
-    deviceConfig.mqtt_port = prefs.getUShort("mqtt_port", deviceConfig.mqtt_port);
-    prefs.getString("mqtt_cid", deviceConfig.mqtt_client_id, sizeof(deviceConfig.mqtt_client_id));
-    prefs.getString("mqtt_user", deviceConfig.mqtt_user, sizeof(deviceConfig.mqtt_user));
-    prefs.getString("mqtt_pass", deviceConfig.mqtt_password, sizeof(deviceConfig.mqtt_password));
-    prefs.getString("mqtt_topic", deviceConfig.mqtt_topic, sizeof(deviceConfig.mqtt_topic));
+    DeviceConfig loaded = deviceConfig; // start from the defaults already applied above
 
-    prefs.getString("ntrip_host", deviceConfig.ntrip_host, sizeof(deviceConfig.ntrip_host));
-    deviceConfig.ntrip_port = prefs.getUShort("ntrip_port", deviceConfig.ntrip_port);
-    prefs.getString("ntrip_mnt", deviceConfig.ntrip_mountpoint, sizeof(deviceConfig.ntrip_mountpoint));
-    prefs.getString("ntrip_user", deviceConfig.ntrip_user, sizeof(deviceConfig.ntrip_user));
-    prefs.getString("ntrip_pass", deviceConfig.ntrip_password, sizeof(deviceConfig.ntrip_password));
+    prefs.getString("mqtt_host", loaded.mqtt_host, sizeof(loaded.mqtt_host));
+    loaded.mqtt_port = prefs.getUShort("mqtt_port", loaded.mqtt_port);
+    prefs.getString("mqtt_cid", loaded.mqtt_client_id, sizeof(loaded.mqtt_client_id));
+    prefs.getString("mqtt_user", loaded.mqtt_user, sizeof(loaded.mqtt_user));
+    prefs.getString("mqtt_pass", loaded.mqtt_password, sizeof(loaded.mqtt_password));
+    prefs.getString("mqtt_topic", loaded.mqtt_topic, sizeof(loaded.mqtt_topic));
 
-    deviceConfig.measurement_interval_s = prefs.getUInt("interval_s", deviceConfig.measurement_interval_s);
-    deviceConfig.fix_timeout_s = prefs.getUInt("timeout_s", deviceConfig.fix_timeout_s);
-    deviceConfig.good_accuracy_m = prefs.getFloat("accuracy_m", deviceConfig.good_accuracy_m);
+    prefs.getString("ntrip_host", loaded.ntrip_host, sizeof(loaded.ntrip_host));
+    loaded.ntrip_port = prefs.getUShort("ntrip_port", loaded.ntrip_port);
+    prefs.getString("ntrip_mnt", loaded.ntrip_mountpoint, sizeof(loaded.ntrip_mountpoint));
+    prefs.getString("ntrip_user", loaded.ntrip_user, sizeof(loaded.ntrip_user));
+    prefs.getString("ntrip_pass", loaded.ntrip_password, sizeof(loaded.ntrip_password));
+
+    loaded.measurement_interval_s = prefs.getUInt("interval_s", loaded.measurement_interval_s);
+    loaded.fix_timeout_s = prefs.getUInt("timeout_s", loaded.fix_timeout_s);
+    loaded.good_accuracy_m = prefs.getFloat("accuracy_m", loaded.good_accuracy_m);
+
+    // Guard against a previously-saved blank/corrupt entry (see
+    // config_portal.cpp for how this is now prevented going forward) -
+    // fall back to the compiled-in defaults instead of running with
+    // empty hosts / a zero measurement interval.
+    bool looksValid = strlen(loaded.mqtt_host) > 0 && strlen(loaded.ntrip_host) > 0 &&
+                       loaded.mqtt_port > 0 && loaded.ntrip_port > 0 &&
+                       loaded.measurement_interval_s > 0 && loaded.fix_timeout_s > 0;
+
+    if (looksValid) {
+      deviceConfig = loaded;
+    } else {
+      hasSavedConfig = false;
+      Serial.println(F("Saved config in NVS looked blank/corrupt (empty host or zero interval) - ignoring it, using compiled-in defaults instead."));
+    }
   }
   prefs.end();
 
