@@ -2,55 +2,31 @@
 #include "device_config.h"
 #include "gnss.h"
 #include "isrg_root_x1.h"
-#include <WiFiClientSecure.h>
-#include <PubSubClient.h>
+#include "modem.h"
 #include <ArduinoJson.h>
 #include <string.h>
 
-static WiFiClientSecure netClient;
-static PubSubClient client(netClient);
-static bool caLoaded = false;
+static bool connected = false;
 
 bool mqttConnectBroker() {
-  if (!caLoaded) {
-    netClient.setCACert(ISRG_ROOT_X1_CA);
-    caLoaded = true;
-  }
-
-  client.setServer(deviceConfig.mqtt_host, deviceConfig.mqtt_port);
-
   Serial.printf("Connecting to MQTT broker %s:%d ...\n", deviceConfig.mqtt_host, deviceConfig.mqtt_port);
 
-  bool ok;
-  if (strlen(deviceConfig.mqtt_user) > 0) {
-    ok = client.connect(deviceConfig.mqtt_client_id, deviceConfig.mqtt_user, deviceConfig.mqtt_password);
-  } else {
-    ok = client.connect(deviceConfig.mqtt_client_id);
-  }
+  connected = modemMqttConnect(deviceConfig.mqtt_host, deviceConfig.mqtt_port,
+                                deviceConfig.mqtt_client_id, deviceConfig.mqtt_user,
+                                deviceConfig.mqtt_password, ISRG_ROOT_X1_CA);
 
-  if (!ok) {
-    Serial.printf("MQTT connect failed, state=%d\n", client.state());
-    char tlsErr[128];
-    netClient.lastError(tlsErr, sizeof(tlsErr));
-    if (tlsErr[0] != '\0') {
-      Serial.print(F("TLS error: "));
-      Serial.println(tlsErr);
-    }
-    return false;
-  }
-
-  Serial.println(F("MQTT connected."));
-  return true;
+  Serial.println(connected ? F("MQTT connected.") : F("MQTT connect failed."));
+  return connected;
 }
 
 bool mqttIsConnected() {
-  return client.connected();
+  return connected;
 }
 
 // Field names follow CF (Climate and Forecast) conventions for the
 // geospatial coordinates: latitude, longitude, altitude.
 void mqttPublishPosition(bool qualityOk) {
-  if (!client.connected() || !gnssHasFix()) {
+  if (!connected || !gnssHasFix()) {
     Serial.println(F("Skipping MQTT publish: no MQTT connection or no GNSS fix."));
     return;
   }
@@ -79,7 +55,7 @@ void mqttPublishPosition(bool qualityOk) {
   char payload[512];
   size_t len = serializeJson(doc, payload);
 
-  if (client.publish(deviceConfig.mqtt_topic, (const uint8_t *)payload, len)) {
+  if (modemMqttPublish(deviceConfig.mqtt_topic, (const uint8_t *)payload, len)) {
     Serial.print(F("Published: "));
     Serial.println(payload);
   } else {
@@ -88,5 +64,6 @@ void mqttPublishPosition(bool qualityOk) {
 }
 
 void mqttDisconnectBroker() {
-  client.disconnect();
+  modemMqttDisconnect();
+  connected = false;
 }

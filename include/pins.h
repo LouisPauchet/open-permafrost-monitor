@@ -1,22 +1,38 @@
 #pragma once
 
-// Centralized pin/hardware configuration for the ESP32 DevKit V1
-// + ZED-F9P (gnss.store ELT0128), UART1 on the F9P (SEL jumper unsoldered).
-//   F9P UART1 TXO -> ESP32 GPIO16 (RX2)
-//   F9P UART1 RXI -> ESP32 GPIO17 (TX2)
-//   F9P VCC       -> 3.3V (or 5V pin if using external 5V supply)
-//   F9P GND       -> GND
+// Centralized pin/hardware configuration for the Walter ESP32-S3 field
+// station (ZED-F9P RTK GNSS + Raspberry Shake RS3D geophone + SD storage).
+// Numbers below match the carrier board's pin table exactly.
 
-#define GPS_RX_PIN 16
-#define GPS_TX_PIN 17
+// --- GNSS (ZED-F9P), UART2, 5V rail, SEL jumper unsoldered (UART1 on F9P) ---
+#define GPS_RX_PIN 16   // F9P UART1 TXO -> ESP32 UART2 RXD
+#define GPS_TX_PIN 17   // F9P UART1 RXI <- ESP32 UART2 TXD
 #define GPS_BAUD 38400
+#define GPS_EXTINT_PIN 18 // wake from UBX-RXM-PMREQ backup mode (gnss.h)
 
-// F9P EXTINT pin -> ESP32, used to wake the receiver from UBX-RXM-PMREQ
-// backup mode (software sleep, see gnss.h: gnssSleep()/gnssWakeup()).
-#define GPS_EXTINT_PIN 4
+// --- Geophone (Raspberry Shake RS3D digitizer), UART1, receive-only ---
+#define GEOPHONE_RX_PIN 15
+#define GEOPHONE_BAUD 230400 // see raspberry_shake.md - fixed, not configurable
 
-// SD card logging (raw GNSS data for later PPK/PPP post-processing).
-// Hardware not yet on hand - uncomment and set once the SD reader module
-// and its wiring are chosen. Standard SPI wiring: MOSI/MISO/SCK use the
-// ESP32's default VSPI pins (23/19/18); only CS needs to be picked.
-// #define SD_CS_PIN 5
+// --- SD card, native SDMMC 1-bit mode (not SPI) ---
+#define SD_CLK_PIN 12
+#define SD_CMD_PIN 11
+#define SD_D0_PIN 13
+// D3 must stay pulled up even in 1-bit mode, or the card silently falls
+// back to SPI mode - this pin is wired, not bit-banged by firmware.
+#define SD_D3_PIN 38
+#define SD_CARD_DETECT_PIN 39 // wired; not currently read by firmware
+// 3V3_EN: switched 3.3V rail that powers the SD card. Active LOW (drive
+// low to enable). Held enabled continuously - geophone logging never
+// stops, so there's no per-cycle power-gating to do here.
+#define SD_POWER_EN_PIN 0
+
+// --- Field service cable ---
+// Grounded by the setup cable's 4th wire to enter config-menu + SD-access
+// mode (see field_service.h). Console runs over native USB (CDC), not the
+// exposed-but-unused UART0 (IO44/IO43).
+#define FIELD_MODE_SELECT_PIN 40
+
+// --- Battery monitoring ---
+#define BATTERY_EXTERNAL_ADC_PIN 2
+#define BATTERY_INTERNAL_ADC_PIN 1

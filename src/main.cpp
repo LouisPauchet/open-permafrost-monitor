@@ -1,53 +1,21 @@
 #include <Arduino.h>
-#include <WiFi.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
 
 #include "device_config.h"
-#include "config_portal.h"
 #include "gnss.h"
+#include "modem.h"
 #include "ntrip_client.h"
 #include "mqtt_client.h"
 #include "sd_logger.h"
 
-// The default 8KB Arduino loop-task stack is too small for a TLS handshake
-// (WiFiClientSecure/mbedTLS) and crashes with a stack overflow at connect time.
-SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+// TODO(next stage): main.cpp is still the old deep-sleep-per-cycle shape
+// here - this is just the WiFi->cellular transport swap (stage a of the
+// field-deployment rewrite). It gets replaced by a persistent loop() once
+// the geophone module lands, since that needs the CPU continuously awake.
 
-static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
-
-static bool connectWiFiSTA() {
-  // The config portal (if it ran this boot) already connects WiFi - calling
-  // WiFi.begin() again here would restart the association and race with
-  // DHCP, briefly leaving WiFi.status() == WL_CONNECTED with IP 0.0.0.0.
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("WiFi already connected, IP: "));
-    Serial.println(WiFi.localIP());
-    return true;
-  }
-
-  WiFi.mode(WIFI_STA);
-  // ESP32 WiFi power-save (modem sleep) periodically drops the association
-  // (typically every ~30-60s) to save power - disable it for a stable link.
-  WiFi.setSleep(false);
-  WiFi.begin(); // reconnect with credentials saved by the config portal
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(250);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("WiFi connected, IP: "));
-    Serial.println(WiFi.localIP());
-    return true;
-  }
-
-  Serial.println(F("WiFi connect failed."));
-  return false;
-}
 
 static void goToSleep() {
   Serial.printf("Sleeping for %u s...\n", deviceConfig.measurement_interval_s);
@@ -60,7 +28,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
-  Serial.println(F("ESP32 <-> ZED-F9P RTK permafrost monitor"));
+  Serial.println(F("Walter <-> ZED-F9P RTK permafrost monitor"));
 
   loadDeviceConfig();
   initSDLogger(); // no-op today (no reader wired up yet); ready once it is
@@ -77,12 +45,14 @@ void setup() {
   Serial.printf("Wake cause: %d (ESP_SLEEP_WAKEUP_TIMER=%d), reset reason: %d\n",
                 wakeReason, ESP_SLEEP_WAKEUP_TIMER, esp_reset_reason());
 
-  if (!wokeFromTimer) {
-    Serial.println(F("Power-on/reset boot - opening the setup portal."));
-    runConfigPortal();
+  if (!modemInit()) {
+    Serial.println(F("Modem init failed - sleeping and retrying next cycle."));
+    gnssSleep();
+    goToSleep();
+    return;
   }
 
-  if (!connectWiFiSTA()) {
+  if (!modemConnect()) {
     gnssSleep();
     goToSleep();
     return;
@@ -144,7 +114,6 @@ void setup() {
   }
 
   ntripDisconnect();
-  WiFi.disconnect(true);
   closeSDLogger();
   gnssSleep();
 
