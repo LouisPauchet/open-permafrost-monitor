@@ -6,6 +6,11 @@
 #include <stdlib.h>
 #include <math.h>
 
+// Mirror every raw byte from the F9P to the USB serial monitor - useful for
+// debugging (e.g. confirming GST/NMEA output timing around EXTINT wake).
+// Flip to false to go back to summary-only output.
+static const bool DEBUG_PRINT_RAW_GNSS = true;
+
 static HardwareSerial GPSSerial(2);
 static TinyGPSPlus gps;
 
@@ -110,6 +115,9 @@ void gnssWakeup() {
 void pollGNSS() {
   while (GPSSerial.available() > 0) {
     char c = GPSSerial.read();
+    if (DEBUG_PRINT_RAW_GNSS) {
+      Serial.write(c);
+    }
     sdLogRawByte((uint8_t)c);
     gps.encode(c);
 
