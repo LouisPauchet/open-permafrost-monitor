@@ -192,6 +192,12 @@ size_t modemSocketAvailable() {
 }
 
 size_t modemSocketRead(uint8_t *buf, size_t maxLen) {
+  // Don't rely on callers to call modemSocketAvailable() first - ntripPoll()
+  // (the main RTCM consumer) calls this directly. Draining here too means
+  // the ring gets serviced regardless of which function a caller reaches
+  // for first.
+  drainSocketRing();
+
   size_t n = maxLen < socketRxLen ? maxLen : socketRxLen;
   memcpy(buf, socketRxBuf, n);
   if (n < socketRxLen) {
