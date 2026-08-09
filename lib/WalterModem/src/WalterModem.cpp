@@ -3275,16 +3275,26 @@ void WalterModem::_processModemRSP(WalterModemCmd* cmd, WalterModemBuffer* buff)
       dataReceived = atoi(start);
     }
 
-    cmd->rsp->type = WALTER_MODEM_RSP_DATA_TYPE_SOCKET;
-    cmd->rsp->data.socketResponse.socketId = sockId;
-    cmd->rsp->data.socketResponse.bytesReceived = dataReceived;
-
-    /*
-     * If cmd->payload and cmd->payloadSize are null, we cannot store the result. We can only hope
-     * the user is using a callback which has access to the raw buffer.
+    /* PATCH (open_permafrost_monitor): unlike most other branches in this
+     * function (e.g. the SIM card IMSI one below), this one dereferenced
+     * cmd unconditionally - a second, separate crash site from the same
+     * underlying cause as the _finishModemCMD patch above: a stray/late
+     * "+SQNSRECV: " response arriving with no command actually
+     * outstanding (cmd == NULL). Confirmed reproducible on real hardware
+     * during an NTRIP RTCM burst. See lib/WalterModem/README-PATCH.md.
      */
-    if(cmd->payload) {
-      memcpy(cmd->payload, payload, dataReceived);
+    if(cmd != NULL) {
+      cmd->rsp->type = WALTER_MODEM_RSP_DATA_TYPE_SOCKET;
+      cmd->rsp->data.socketResponse.socketId = sockId;
+      cmd->rsp->data.socketResponse.bytesReceived = dataReceived;
+
+      /*
+       * If cmd->payload and cmd->payloadSize are null, we cannot store the result. We can only hope
+       * the user is using a callback which has access to the raw buffer.
+       */
+      if(cmd->payload) {
+        memcpy(cmd->payload, payload, dataReceived);
+      }
     }
 
     goto after_processing_logic;

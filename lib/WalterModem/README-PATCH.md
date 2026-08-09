@@ -42,6 +42,26 @@ nothing to finish/notify for a command that doesn't exist, so this is
 correct behavior, not just a crash workaround. See the `PATCH` comment at
 the top of `_finishModemCMD()` in `src/WalterModem.cpp`.
 
+## Second occurrence: `+SQNSRECV: ` response branch
+
+Fixing the above got further, but hit a second, separate crash at the
+same fault address (`EXCVADDR 0x548`) via a different path -
+`_processModemRSP()`'s `"+SQNSRECV: "` branch dereferences `cmd->rsp`
+unconditionally, unlike most other branches in the same function (e.g.
+the SIM card IMSI branch a bit further down, which explicitly checks
+`cmd == NULL` first). A stray/late `+SQNSRECV: ` response with no
+command actually outstanding crashes the same way. Patched the same way
+- skip the `cmd->` writes when `cmd == NULL`, then fall through to the
+(already null-safe) finish logic. See the `PATCH` comment above that
+branch in `src/WalterModem.cpp`.
+
+Given the same unguarded-dereference pattern has now shown up twice in
+independent branches of `_processModemRSP()`, treat any *third* crash at
+this same fault address as another instance of it - check whichever
+`_buffStartsWith(buff, "...")` branch is on the backtrace for a `cmd->`
+access that isn't preceded by a `cmd != NULL` / `cmd == NULL` check, and
+patch it the same way.
+
 ## Removing this
 
 If a future WalterModem release fixes this upstream, delete this directory,
