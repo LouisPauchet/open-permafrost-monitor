@@ -48,13 +48,33 @@ static void socketEventHandler(WMSocketEventType event, const WMSocketEventData 
 // (incorrect parameters). Always ask for the max instead, and use the
 // response's own bytesReceived to know how much of the buffer is actually
 // valid.
+//
+// Chunk size deliberately smaller than the modem's real max (1500): during
+// a sustained RTCM burst, RING events can fire faster than one round-trip
+// takes, so ntripPoll()'s drain loop re-enters this function back-to-back
+// with ~zero gap. Live hardware hit a run where the modem then answered
+// several AT+SQNSRECV calls with unsolicited "+CME ERROR: 4" (no request
+// from us matched to them - a response-tracking desync in the modem/
+// library, not our command). A smaller request shortens each round-trip;
+// minDrainGapMs adds a deliberate breathing gap between them. Neither is a
+// proven fix for the underlying desync, just a reduction in how hard we
+// hammer the AT channel - see the task watchdog added in main.cpp for the
+// actual safety net (self-reboot) if a stall happens anyway.
 static void drainSocketRing() {
   if (!socketRingPending) {
     return;
   }
-  socketRingPending = false;
 
-  uint8_t chunk[1500];
+  static unsigned long lastDrainMs = 0;
+  const unsigned long minDrainGapMs = 50;
+  if (millis() - lastDrainMs < minDrainGapMs) {
+    return; // leave socketRingPending set - try again next call
+  }
+
+  socketRingPending = false;
+  lastDrainMs = millis();
+
+  uint8_t chunk[512];
   WalterModemRsp rsp;
   if (!modem.socketReceive(MODEM_SOCKET_ID, chunk, sizeof(chunk), &rsp)) {
     return;
