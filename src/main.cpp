@@ -190,6 +190,20 @@ void setup() {
   gnssWakeup();
   delay(500);
   initGNSS();
+
+  // One-time wiring/baud smoke test, run before the module is ever put to
+  // sleep: isolates "is the raw UART link alive at all" from "does the
+  // EXTINT/PMREQ sleep-wake cycle work" - the two have identical symptoms
+  // (zero bytes received) from inside the main loop, since polling+printing
+  // only happens after gnssSleep() has already run once.
+  Serial.println(F("GNSS: listening for raw UART bytes (wiring/baud check)..."));
+  unsigned long gnssCheckStart = millis();
+  while (millis() - gnssCheckStart < 3000) {
+    pollGNSS();
+  }
+  Serial.printf("GNSS: %lu chars seen in 3s smoke test (0 = check wiring/baud/SEL jumper, not sleep/wake).\n",
+                (unsigned long)gnssCharsProcessed());
+
   gnssSleep(); // idle until the first fix cycle in loop()
 
   if (fieldModeRequested()) {
