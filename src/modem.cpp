@@ -295,9 +295,22 @@ bool modemSocketOpen(const char *host, uint16_t port) {
 // far. Making the send async too - fire-and-forget, no result the caller
 // needs synchronously anyway - keeps app-side command submission from
 // ever blocking during exactly that window.
+// Set here (on WalterModem's own task, when the async result actually
+// comes back) and consumed by modemLastSendFailed() (on the main loop
+// task). The command is successfully *queued* well before we know whether
+// it actually succeeded - a caller that only checks the queue result (as
+// ntripSendGGA()/main.cpp did before) has no way to react to a failure
+// that shows up later, so a real failure was waiting a full resend
+// interval (7s) to retry instead of the ~1.5s this now allows. GGA is
+// required for this NTRIP mount (network RTK/VRS - confirmed with the
+// user), not just nice-to-have, so a fix quality stuck on autonomous
+// despite RTCM flowing traces back to this gap.
+static volatile bool lastSendFailed = false;
+
 static void onSocketSendComplete(const WalterModemRsp *rsp, void *args) {
   if (rsp->result != WALTER_MODEM_STATE_OK) {
-    Serial.println(F("Modem: async GGA send failed (will retry next resend interval)."));
+    lastSendFailed = true;
+    Serial.println(F("Modem: async send failed."));
   }
 }
 
@@ -305,6 +318,12 @@ bool modemSocketSend(const uint8_t *data, size_t len) {
   static WalterModemRsp sendRsp; // must outlive the async call
   return modem.socketSend(MODEM_SOCKET_ID, (uint8_t *)data, (uint16_t)len, WALTER_MODEM_RAI_NO_INFO,
                            &sendRsp, onSocketSendComplete, nullptr);
+}
+
+bool modemLastSendFailed() {
+  bool failed = lastSendFailed;
+  lastSendFailed = false; // consume - each check reflects only what's new since the last one
+  return failed;
 }
 
 bool modemReceiveBusy() {

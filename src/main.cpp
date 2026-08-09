@@ -34,6 +34,13 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // divide the caster's cycle drifts in and out of phase with it instead,
 // so most attempts land outside the burst window.
 static const unsigned long GGA_RESEND_INTERVAL_MS = 7000;
+// This NTRIP mount is network RTK/VRS (confirmed with the user) - it
+// genuinely needs GGA to know where to center corrections, unlike a
+// single physical base station that would send the same stream
+// regardless. A send that fails (discovered asynchronously, after
+// modemSocketSend() already reported "queued OK") gets retried this soon
+// instead of waiting a full GGA_RESEND_INTERVAL_MS - see modemLastSendFailed().
+static const unsigned long GGA_FAILURE_RETRY_MS = 1500;
 static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
 static const unsigned long MINISEED_FLUSH_INTERVAL_MS = 5000;
 // Not user-configurable (kept out of the config menu per the "as few
@@ -80,7 +87,7 @@ static void runGnssFixCycle() {
                 deviceConfig.fix_timeout_s, deviceConfig.good_accuracy_m);
 
   unsigned long fixWaitStart = millis();
-  unsigned long lastGgaSent = 0;
+  unsigned long nextGgaAttemptMs = 0;
   unsigned long lastGstEnableRetry = 0;
   bool qualityOk = false;
 
@@ -93,13 +100,23 @@ static void runGnssFixCycle() {
       ntripPoll();
 
       unsigned long now = millis();
-      if (now - lastGgaSent >= GGA_RESEND_INTERVAL_MS) {
-        // Only reset the timer if the send actually happened - ntripSendGGA()
-        // defers (returns false) rather than send while a receive is in
-        // flight, and that should be retried on the very next iteration,
-        // not after a fresh full interval.
+
+      // A prior send can fail *after* modemSocketSend() already reported
+      // "queued OK" - the actual result only arrives later, asynchronously.
+      // Checked every iteration so a real failure gets noticed quickly and
+      // pulls the next attempt in, rather than waiting out the full
+      // interval as if nothing had gone wrong.
+      if (modemLastSendFailed()) {
+        nextGgaAttemptMs = now + GGA_FAILURE_RETRY_MS;
+      }
+
+      if (now >= nextGgaAttemptMs) {
         if (ntripSendGGA(gnssLastGGA())) {
-          lastGgaSent = now;
+          nextGgaAttemptMs = now + GGA_RESEND_INTERVAL_MS;
+        } else {
+          // Deferred (a receive was in flight) rather than sent at all -
+          // retry next iteration, not after a fresh full interval.
+          nextGgaAttemptMs = now;
         }
       }
     }

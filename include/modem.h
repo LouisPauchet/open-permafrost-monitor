@@ -25,6 +25,14 @@ void modemSocketClose();
 // this and defer rather than risk it.
 bool modemReceiveBusy();
 
+// True if the most recent async send (since the last call to this
+// function) failed - e.g. it was successfully queued but the modem later
+// answered with an error. Distinct from modemSocketSend()'s own return
+// value, which only reflects whether the command was queued, not whether
+// it actually succeeded (that's only known later, asynchronously).
+// Consumes the flag: only reports failures new since the last check.
+bool modemLastSendFailed();
+
 // MQTT (used by mqtt_client.cpp for batched telemetry).
 bool modemMqttConnect(const char *host, uint16_t port, const char *clientId,
                        const char *user, const char *pass, const char *caCert);
