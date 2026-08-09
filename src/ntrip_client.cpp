@@ -156,6 +156,12 @@ bool ntripSendGGA(const char *ggaLine) {
   if (modemReceiveBusy()) {
     return false;
   }
+  // Checking "not busy right now" alone still only got ~29% of sends
+  // through on live hardware, because RTCM now drains almost
+  // continuously - a fresh receive can get kicked off in the gap between
+  // this check and the actual send. Claim the channel for a brief window
+  // so no *new* receive starts during it.
+  modemSuppressReceiveFor(300);
   String line = String(ggaLine) + "\r\n";
   modemSocketSend((const uint8_t *)line.c_str(), line.length());
   return true;

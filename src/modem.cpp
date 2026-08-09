@@ -134,6 +134,21 @@ static void onSocketReceiveComplete(const WalterModemRsp *rsp, void *args) {
   }
 }
 
+// Set by modemSuppressReceiveFor() right before a priority send (GGA) so
+// it gets one guaranteed-clear shot at the AT channel instead of racing
+// the receive side. Checking modemReceiveBusy() alone wasn't enough - live
+// hardware showed only ~29% of GGA sends succeeding even with that check,
+// because RTCM now drains almost continuously (every RING re-triggers
+// another receive immediately), so the "not busy" window it was checking
+// for is usually only a few ms wide. A receive that's already in flight
+// when the suppression starts is left alone (its own retry/abandon logic
+// still applies) - this only holds off *new* kickoffs.
+static unsigned long receiveSuppressedUntilMs = 0;
+
+void modemSuppressReceiveFor(unsigned long ms) {
+  receiveSuppressedUntilMs = millis() + ms;
+}
+
 // Called from the main loop only (modemSocketAvailable()/Read()) - kicks
 // off at most one async receive per call, never blocks.
 static void drainSocketRing() {
@@ -144,6 +159,10 @@ static void drainSocketRing() {
     } else {
       return; // still within the normal grace period, keep waiting
     }
+  }
+
+  if (millis() < receiveSuppressedUntilMs) {
+    return; // holding off for a priority send - see modemSuppressReceiveFor()
   }
 
   if (!socketRingPending) {

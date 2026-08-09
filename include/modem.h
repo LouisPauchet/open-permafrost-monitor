@@ -25,6 +25,12 @@ void modemSocketClose();
 // this and defer rather than risk it.
 bool modemReceiveBusy();
 
+// Holds off any *new* async receive kickoff for the given duration, so a
+// priority send (GGA) gets one guaranteed-clear shot at the AT channel
+// instead of racing the (often near-continuous) receive side. Does not
+// affect a receive that's already in flight when called.
+void modemSuppressReceiveFor(unsigned long ms);
+
 // True if the most recent async send (since the last call to this
 // function) failed - e.g. it was successfully queued but the modem later
 // answered with an error. Distinct from modemSocketSend()'s own return
