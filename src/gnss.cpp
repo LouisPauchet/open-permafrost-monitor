@@ -54,6 +54,36 @@ static const uint8_t UBX_ENABLE_SFRBX_UART1[] = {
   0x25, 0x3D
 };
 
+// UBX-CFG-VALSET: set CFG-UART1INPROT-RTCM3X (key 0x10730004) = 1 (RAM
+// layer only), i.e. explicitly enable RTCM3 as an *input* protocol on
+// UART1. This is the likely real root cause behind RTK never engaging
+// despite 90KB+/cycle of RTCM being forwarded and GGA reaching the caster:
+// if UART1's input protocol mask doesn't include RTCM3, the F9P discards
+// every RTCM byte before ever attempting to parse it - which would also
+// explain why the RXM-RTCM diagnostic below never reports anything, not
+// even a CRC failure, despite retrying its own enable on a timer. Setting
+// this doesn't touch UBX/NMEA input (VALSET only touches the keys listed),
+// so nothing else about the existing config changes.
+static const uint8_t UBX_SET_UART1_INPROT_RTCM3X[] = {
+  0xB5, 0x62, 0x06, 0x8A, 0x09, 0x00,
+  0x00, 0x01, 0x00, 0x00,             // version=0, layers=RAM, transaction=0, reserved0
+  0x04, 0x00, 0x73, 0x10,             // keyID 0x10730004 (CFG-UART1INPROT-RTCM3X), little-endian
+  0x01,                               // value = 1 (enabled)
+  0x22, 0xBF                          // checksum (CK_A, CK_B)
+};
+
+// UBX-CFG-MSG: enable RXM-RTCM (class 0x02, id 0x32) on UART1 - diagnostic
+// only, temporary while chasing why the fix stays autonomous despite a
+// healthy volume of RTCM being forwarded. RXM-RTCM is the F9P's own report
+// of what it did with each incoming RTCM message (type + CRC pass/fail),
+// which is ground truth on whether corrections are actually usable versus
+// just "bytes were sent" - see gnssParseRxmRtcmByte() below.
+static const uint8_t UBX_ENABLE_RXM_RTCM_UART1[] = {
+  0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
+  0x02, 0x32, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+  0x44, 0x16
+};
+
 // UBX-RXM-PMREQ (class 0x02, id 0x41), 16-byte payload version, requesting
 // indefinite backup mode (duration=0), force+backup flags (0x06 - enters
 // backup even with USB attached, so bring-up over USB serial behaves the
@@ -101,8 +131,88 @@ static void rawLogRotateIfNeeded() {
   }
 }
 
+// --- Minimal UBX binary frame parser (RXM-RTCM diagnostic only) ---
+// The F9P's UART interleaves NMEA (line-based, handled below) with UBX
+// binary frames (0xB5 0x62 sync, class/id/length header, payload,
+// 2-byte checksum). This only looks for RXM-RTCM; everything else is
+// skipped once its checksum is (or isn't) verified.
+static uint8_t ubxState = 0;
+static uint8_t ubxClass = 0, ubxMsgId = 0;
+static uint16_t ubxLen = 0, ubxIdx = 0;
+static uint8_t ubxPayload[16];
+static uint8_t ubxCkA = 0, ubxCkB = 0;
+static uint8_t ubxRxCkA = 0;
+
+static void ubxParseByte(uint8_t c) {
+  switch (ubxState) {
+    case 0: ubxState = (c == 0xB5) ? 1 : 0; break;
+    case 1: ubxState = (c == 0x62) ? 2 : 0; break;
+    case 2:
+      ubxClass = c;
+      ubxCkA = c;
+      ubxCkB = c;
+      ubxState = 3;
+      break;
+    case 3:
+      ubxMsgId = c;
+      ubxCkA += c;
+      ubxCkB += ubxCkA;
+      ubxState = 4;
+      break;
+    case 4:
+      ubxLen = c;
+      ubxCkA += c;
+      ubxCkB += ubxCkA;
+      ubxState = 5;
+      break;
+    case 5:
+      ubxLen |= ((uint16_t)c << 8);
+      ubxCkA += c;
+      ubxCkB += ubxCkA;
+      ubxIdx = 0;
+      ubxState = (ubxLen == 0) ? 7 : 6;
+      break;
+    case 6:
+      if (ubxIdx < sizeof(ubxPayload)) {
+        ubxPayload[ubxIdx] = c;
+      }
+      ubxIdx++;
+      ubxCkA += c;
+      ubxCkB += ubxCkA;
+      if (ubxIdx >= ubxLen) {
+        ubxState = 7;
+      }
+      break;
+    case 7:
+      ubxRxCkA = c;
+      ubxState = 8;
+      break;
+    case 8:
+      if (c == ubxCkB && ubxRxCkA == ubxCkA && ubxClass == 0x02 && ubxMsgId == 0x32 &&
+          ubxLen >= 8) {
+        // RXM-RTCM payload: version(1) flags(1) reserved/subType(2)
+        // refStation(2) msgType(2). flags bit0 = crcFailed.
+        bool crcFailed = ubxPayload[1] & 0x01;
+        uint16_t refStation = (uint16_t)ubxPayload[4] | ((uint16_t)ubxPayload[5] << 8);
+        uint16_t msgType = (uint16_t)ubxPayload[6] | ((uint16_t)ubxPayload[7] << 8);
+        Serial.printf("[RTCM-IN] type=%u station=%u %s\n", msgType, refStation,
+                      crcFailed ? "CRC-FAIL" : "ok");
+      }
+      ubxState = 0;
+      break;
+  }
+}
+
 void gnssEnableGST() {
   GPSSerial.write(UBX_ENABLE_GST_UART1, sizeof(UBX_ENABLE_GST_UART1));
+}
+
+void gnssEnableRxmRtcmDiag() {
+  GPSSerial.write(UBX_ENABLE_RXM_RTCM_UART1, sizeof(UBX_ENABLE_RXM_RTCM_UART1));
+}
+
+void gnssEnableRtcm3Input() {
+  GPSSerial.write(UBX_SET_UART1_INPROT_RTCM3X, sizeof(UBX_SET_UART1_INPROT_RTCM3X));
 }
 
 // Safe to call once per boot only - HardwareSerial::setRxBufferSize()
@@ -114,6 +224,8 @@ static bool uartStarted = false;
 
 void gnssReenableMessages() {
   gnssEnableGST();
+  gnssEnableRtcm3Input();
+  GPSSerial.write(UBX_ENABLE_RXM_RTCM_UART1, sizeof(UBX_ENABLE_RXM_RTCM_UART1));
 
   if (sdStorageAvailable()) {
     GPSSerial.write(UBX_ENABLE_RAWX_UART1, sizeof(UBX_ENABLE_RAWX_UART1));
@@ -160,6 +272,7 @@ void pollGNSS() {
       rawLogFile.write((uint8_t)c);
     }
     gps.encode(c);
+    ubxParseByte((uint8_t)c);
 
     if (c == '\n') {
       lineBuf[lineLen] = '\0';

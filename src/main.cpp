@@ -89,6 +89,7 @@ static void runGnssFixCycle() {
   unsigned long fixWaitStart = millis();
   unsigned long nextGgaAttemptMs = 0;
   unsigned long lastGstEnableRetry = 0;
+  unsigned long lastRxmRtcmDiagResend = 0;
   bool qualityOk = false;
 
   while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL) {
@@ -127,6 +128,18 @@ static void runGnssFixCycle() {
     if (!gnssHasAccuracyEstimate() && millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
       lastGstEnableRetry = millis();
       gnssEnableGST();
+    }
+
+    // Temporary diagnostic (RXM-RTCM): same "may land before the F9P is
+    // ready" risk as GST above, but with no isValid()-style flag to gate
+    // on, so just resent unconditionally on the same cadence for the whole
+    // cycle - negligible cost, guarantees it isn't silently lost to timing.
+    if (millis() - lastRxmRtcmDiagResend >= GST_ENABLE_RETRY_INTERVAL_MS) {
+      lastRxmRtcmDiagResend = millis();
+      gnssEnableRxmRtcmDiag();
+      // Same timing risk as the above two - resent on the same cadence.
+      // Suspected real fix for RTK never engaging: see gnss.h.
+      gnssEnableRtcm3Input();
     }
 
     if (gnssHasFix() && gnssHasAccuracyEstimate() && gnssHorizontalAccuracy() <= deviceConfig.good_accuracy_m) {
