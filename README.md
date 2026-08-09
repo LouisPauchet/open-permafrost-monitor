@@ -1,24 +1,35 @@
-# Open Permafrost Monitor — RTK GNSS field logger
+# Open Permafrost Monitor — RTK GNSS + seismic field station
 
-ESP32 + u-blox ZED-F9P (gnss.store ELT0128) RTK rover. Wakes on a configurable interval, connects to WiFi, pulls RTCM corrections from an NTRIP caster, waits for a fix meeting a configurable accuracy threshold, publishes the position over MQTTS, then deep-sleeps until the next cycle.
+Walter ESP32-S3 (Sequans GM02SP LTE-M/NB-IoT modem) driving a u-blox ZED-F9P
+RTK GNSS receiver and a Raspberry Shake RS3D geophone, for unattended field
+deployment with no WiFi/router dependency. Runs continuously (no deep sleep,
+since the geophone streams 24/7): periodic RTK fixes via NTRIP, batched
+MQTT telemetry, and a daily push of the day's raw files to S3-compatible
+storage over the cellular link.
 
 ## Hardware
 
-- ESP32 DevKit V1
-- gnss.store ELT0128 (u-blox ZED-F9P breakout)
-- U.FL/IPEX GNSS antenna with clear sky view
+- Walter ESP32-S3 board (Sequans GM02SP LTE-M/NB-IoT modem, no WiFi used)
+- u-blox ZED-F9P RTK GNSS (gnss.store ELT0128), UART1 on the F9P, SEL jumper
+  unsoldered, powered from the board's 5V rail
+- Raspberry Shake RS3D geophone digitizer (protocol reverse-engineered in
+  [raspberry_shake.md](raspberry_shake.md)), UART, receive-only, fixed
+  230400 baud
+- microSD card on the native SDMMC peripheral (1-bit mode, not SPI) —
+  **D3 needs a pull-up resistor even in 1-bit mode**, or the card falls back
+  to SPI mode and mounting fails
+- A 4-wire field-service cable (ground + the console/SD-access trigger pin)
 
-## Wiring (UART1, SEL jumper left unsoldered)
+All pin assignments live in one place: [include/pins.h](include/pins.h).
 
-| ZED-F9P    | ESP32       |
-|------------|-------------|
-| UART1 TXO  | GPIO16 (RX2)|
-| UART1 RXI  | GPIO17 (TX2)|
-| EXTINT     | GPIO4       |
-| VCC (3.3V) | 3.3V        |
-| GND        | GND         |
-
-Both boards are 3.3V logic, so no level shifter is needed. Do not power the F9P from 5V. All pin assignments live in one place: [include/pins.h](include/pins.h).
+| Subsystem       | Pins                                             |
+|-----------------|---------------------------------------------------|
+| GNSS (UART2)    | RX 16, TX 17, EXTINT 18                            |
+| Geophone (UART1)| RX 15 (receive-only)                               |
+| SD (SDMMC)      | CLK 12, CMD 11, D0 13, D3 38, card-detect 39      |
+| SD power        | 3V3_EN 0 (active LOW, held enabled continuously)   |
+| Field service   | select 40 (grounded by the service cable)          |
+| Battery ADC     | external 2, internal 1                             |
 
 ## Code layout
 
@@ -26,47 +37,85 @@ Both boards are 3.3V logic, so no level shifter is needed. Do not power the F9P 
 |------|-----------------|
 | [include/pins.h](include/pins.h) | All GPIO/UART pin assignments |
 | [include/device_config.h](include/device_config.h) / [src/device_config.cpp](src/device_config.cpp) | Field-configurable settings, persisted in NVS flash |
-| [include/config_portal.h](include/config_portal.h) / [src/config_portal.cpp](src/config_portal.cpp) | WiFi AP + captive web portal for field setup |
-| [include/gnss.h](include/gnss.h) / [src/gnss.cpp](src/gnss.cpp) | ZED-F9P UART, NMEA parsing, fix quality/accuracy |
-| [include/ntrip_client.h](include/ntrip_client.h) / [src/ntrip_client.cpp](src/ntrip_client.cpp) | NTRIP caster connection, RTCM forwarding |
-| [include/mqtt_client.h](include/mqtt_client.h) / [src/mqtt_client.cpp](src/mqtt_client.cpp) | MQTTS publish |
-| [include/isrg_root_x1.h](include/isrg_root_x1.h) | Let's Encrypt root CA, for validating the MQTT broker's TLS cert |
-| [include/sd_logger.h](include/sd_logger.h) / [src/sd_logger.cpp](src/sd_logger.cpp) | Raw GNSS logging to SD for later PPK/PPP post-processing (pending SD reader hardware) |
-| [src/main.cpp](src/main.cpp) | Orchestrates one wake→measure→publish→sleep cycle |
+| [include/field_service.h](include/field_service.h) / [src/field_service.cpp](src/field_service.cpp) | Text config menu + SD file download over native USB CDC |
+| [include/modem.h](include/modem.h) / [src/modem.cpp](src/modem.cpp) | Thin wrapper around WalterModem: registration, async TCP socket (NTRIP), MQTT, HTTP |
+| [include/gnss.h](include/gnss.h) / [src/gnss.cpp](src/gnss.cpp) | ZED-F9P UART, NMEA parsing, fix quality/accuracy, EXTINT sleep/wake |
+| [include/ntrip_client.h](include/ntrip_client.h) / [src/ntrip_client.cpp](src/ntrip_client.cpp) | NTRIP caster connection (with retry), RTCM forwarding, GGA relay |
+| [include/geophone.h](include/geophone.h) / [src/geophone.cpp](src/geophone.cpp) | RS3D UART reader, continuous JSON sample stream parser |
+| [include/miniseed_writer.h](include/miniseed_writer.h) / [src/miniseed_writer.cpp](src/miniseed_writer.cpp) | Minimal MiniSEED writer, GNSS-timestamped |
+| [include/sd_storage.h](include/sd_storage.h) / [src/sd_storage.cpp](src/sd_storage.cpp) | SD_MMC mount, daily-rotated file helpers shared by every logger |
+| [include/position_log.h](include/position_log.h) / [src/position_log.cpp](src/position_log.cpp) | Daily position CSV — also the MQTT batch buffer |
+| [include/battery.h](include/battery.h) / [src/battery.cpp](src/battery.cpp) | Internal/external battery voltage via ADC |
+| [include/mqtt_client.h](include/mqtt_client.h) / [src/mqtt_client.cpp](src/mqtt_client.cpp) | Batched MQTTS telemetry publish |
+| [include/upload_client.h](include/upload_client.h) / [src/upload_client.cpp](src/upload_client.cpp) | Daily chunked HTTP POST of the day's files to a user-run backend |
+| [include/isrg_root_x1.h](include/isrg_root_x1.h) | Let's Encrypt root CA for TLS validation (MQTT + upload) |
+| [src/main.cpp](src/main.cpp) | Persistent scheduler tying everything together |
 | [include/secrets.h](include/secrets.h) (git-ignored, copy from `secrets.h.example`) | Compiled-in **seed defaults** loaded into NVS on first boot only |
+| [lib/WalterModem/](lib/WalterModem/) | Vendored copy of `quickspot/WalterModem` 1.5.0 with two crash-fix patches — see [lib/WalterModem/README-PATCH.md](lib/WalterModem/README-PATCH.md) |
 
-## Field setup (no reflashing needed)
+## Why no deep sleep
 
-On every **power-on or reset** (not on a timer wake from deep sleep), the device opens a WiFi hotspot for 5 minutes, named **"PermafrostMonitor-XXXXXX"** where `XXXXXX` is the last 3 bytes of that unit's ESP32 MAC address — so each physical device in the field has a distinguishable network name when several are deployed at once.
+The geophone streams continuously at 230400 baud with no way to pause it, so
+the CPU can never sleep. `loop()` runs forever, servicing the geophone and
+GNSS UARTs every single iteration, with everything else (GNSS fix cycles,
+telemetry batches, daily uploads) scheduled off its own `millis()` timer.
+Low power now comes from keeping the modem and GNSS idle as much as
+possible while the CPU stays up for the geophone, not from CPU sleep.
 
-1. Connect your phone/laptop to that WiFi network.
-2. Browse to `192.168.4.1`.
-3. Set the WiFi network the device should use in the field, plus:
-   - MQTT host/port/client ID/username(token)/password/topic
-   - NTRIP caster host/port/mountpoint/username/password
-   - **Measurement interval** — how often to wake, measure, and publish (seconds)
-   - **Max wait for a good fix** — give up and publish best-effort after this long (seconds)
-   - **Good fix horizontal accuracy** — threshold in meters (e.g. `0.05` for 5 cm) to consider a fix "good enough"
-4. Submit. Settings are saved to flash (NVS) and used from then on, surviving reboots and reflashes.
+## Field service mode
 
-If nobody connects within 5 minutes, the device proceeds with whatever was last saved (or the compiled-in defaults from `secrets.h` on a brand-new device).
+Grounding the field-service select pin (cable's 4th wire) — either at boot,
+or at any point during normal operation — reboots the device straight into
+a text menu over native USB serial (115200 8N1). No physical reset needed;
+unplugging the cable (or `0) Save and exit`) reboots back into normal
+operation. From there a technician can:
 
-## Low-power measurement cycle
+- Adjust the GNSS measurement interval, fix timeout, and good-accuracy
+  threshold
+- Set MQTT / NTRIP / upload-endpoint credentials (stored in NVS, survives
+  reflashing)
+- List and download files off the SD card, streamed over the same serial
+  connection (`BEGIN <name> <size>` … raw bytes … `END`) — true USB mass
+  storage wasn't possible without forking the SD_MMC library, so this is
+  the alternative
 
-Each wake:
+Kept deliberately minimal (per the "as few parameters as possible"
+preference) — most tuning happens through `secrets.h` at flash time.
 
-1. Pulse the F9P's EXTINT pin to wake it from `UBX-RXM-PMREQ` backup mode (harmless no-op if it wasn't asleep, e.g. the very first boot), then give it a moment to come back up.
-2. Connect WiFi (using credentials saved via the portal).
-3. Connect to the NTRIP caster and start forwarding RTCM3 corrections into the F9P.
-4. Poll the GNSS until horizontal accuracy (from the receiver's own GST error estimate) is at or below the configured threshold, or until the configured timeout elapses — whichever comes first.
-5. Connect to the MQTT broker over TLS (cert validated against Let's Encrypt's root) and publish the position.
-6. Send the F9P back into `UBX-RXM-PMREQ` backup mode, disconnect everything else, and deep-sleep for the configured measurement interval. On wake, execution restarts from the top (no state is kept in RAM) — the portal is skipped because the wake reason is a timer, not a power-on/reset.
+## GNSS fix cycle
 
-The F9P draws 100+ mA continuously when active, dwarfing the ESP32's own ~10µA deep-sleep current, so putting it to sleep too (rather than leaving it powered/active the whole interval) is what makes the low-power cycle actually low-power. Backup mode preserves the receiver's RTC/ephemeris, so reacquisition on wake is a fast warm start rather than a full cold start. See [include/gnss.h](include/gnss.h) (`gnssSleep()`/`gnssWakeup()`) for the implementation — the wake source is configured as EXTINT0 **or** UART RX activity, so even if the EXTINT wiring/polarity needs adjustment, sending any byte on the existing UART TX line still recovers the module.
+On the configured `measurement_interval_s`:
+
+1. Pulse the F9P's EXTINT pin to wake it from `UBX-RXM-PMREQ` backup mode.
+2. Connect to the NTRIP caster (retries on failure — 5s for a 401, which
+   this caster's history shows is often transient, 10s otherwise) and start
+   forwarding RTCM3 corrections into the F9P.
+3. Relay the rover's own GGA position back to the caster periodically —
+   required for network RTK/VRS casters (like this deployment's) to center
+   corrections on the rover's actual location, not just nice-to-have.
+4. Poll until horizontal accuracy (from the receiver's own GST error
+   estimate) meets the configured threshold, or the fix timeout elapses.
+5. Append a row to the day's position CSV (time, lat/lon/alt, accuracy,
+   fix quality, battery voltages).
+6. Disconnect NTRIP, send the F9P back into backup mode.
+
+GNSS sleep/wake uses the same EXTINT + `UBX-RXM-PMREQ` mechanism as before;
+UART RX activity is also configured as a wake source as a bring-up safety
+net in case EXTINT wiring/polarity ever needs adjustment.
+
+## Telemetry and daily upload
+
+- **MQTT**: batched, not per-fix — connects once per hour (not
+  user-configurable, to keep the modem idle more) and publishes every
+  position_log row appended since the last batch as one JSON array message.
+- **Daily upload**: on GNSS-date rollover, POSTs the previous day's four
+  rotated files (geophone MiniSEED, GNSS raw log, NTRIP raw log, position
+  CSV) in 32KB chunks to a backend the user runs themselves, authenticated
+  with a single API key (HTTP Basic auth). That backend — not part of this
+  firmware — is responsible for forwarding to actual S3-compatible storage;
+  the device never holds cloud-storage credentials, only one rotatable key.
 
 ## MQTT payload
-
-Published as JSON to the configured topic. Position fields follow CF (Climate and Forecast) convention naming:
 
 ```json
 {
@@ -82,29 +131,37 @@ Published as JSON to the configured topic. Position fields follow CF (Climate an
 }
 ```
 
-`fix_quality` follows the standard NMEA GGA fix indicator (0=no fix, 1=autonomous, 2=DGPS, 4=RTK fixed, 5=RTK float). `quality_ok` reflects whether `horizontal_accuracy` met the configured threshold before the wait timed out.
-
-## Post-processing (PPK/PPP) — SD card logging
-
-Not yet wired up (SD reader hardware pending), but scaffolded so it activates without further code changes once it arrives:
-
-1. Uncomment and set `SD_CS_PIN` in [include/pins.h](include/pins.h) to match your reader's wiring (standard SPI: MOSI/MISO/SCK are the ESP32's default VSPI pins 23/19/18, only CS varies by board).
-2. On the next boot, `initSDLogger()` will detect the card, open a new log file (`/gnss_NNNNNN.ubx`, an incrementing counter stored in RTC memory), and `gnss.cpp` will both enable `RXM-RAWX`/`RXM-SFRBX` raw measurement output on the F9P and write every raw byte from its UART (NMEA + UBX) straight to that file.
-3. Those `.ubx` log files can be fed into RTKLIB (`convbin`) or u-center to convert to RINEX and post-process against a base station's raw data (or precise products) for accuracy beyond what a live RTK float/fixed solution reached — useful for cycles where `quality_ok` came back `false`.
-
-If `SD_CS_PIN` is left undefined (the current state), all of this is a complete no-op — no behavior change, no wasted cycles.
+Sent as a JSON array of rows per batch. `fix_quality` follows the standard
+NMEA GGA fix indicator (0=no fix, 1=autonomous, 2=DGPS, 4=RTK fixed,
+5=RTK float). `quality_ok` reflects whether `horizontal_accuracy` met the
+configured threshold before the wait timed out.
 
 ## Build & flash
 
 ```
-pio run -t upload
-pio device monitor
+pio run -e walter -t upload
+pio device monitor -e walter
 ```
 
-(or open this folder in the PlatformIO VS Code extension and use the Upload / Monitor buttons)
+(or open this folder in the PlatformIO VS Code extension and use the
+Upload / Monitor buttons)
 
-## Notes
+## Notes / known issues
 
-- `WiFi.setSleep(false)` is set on every connect to avoid ESP32's modem-sleep power-save mode, which otherwise drops the WiFi association roughly every 30-60s.
-- The Arduino loop-task stack is raised to 16KB (`SET_LOOP_TASK_STACK_SIZE`) because the default 8KB is too small for a TLS handshake and crashes with a stack overflow.
-- `secrets.h` is git-ignored; only `secrets.h.example` (with placeholder values) is committed.
+- The Arduino loop-task stack is raised to 16KB (`SET_LOOP_TASK_STACK_SIZE`)
+  and arduino-esp32's UART event task stack to 8KB
+  (`ARDUINO_SERIAL_EVENT_TASK_STACK_SIZE`) — both default sizes are too
+  small for WalterModem's TLS/AT-parsing workload and crash with a stack
+  overflow otherwise.
+- A task watchdog (60s) reboots the device if the main loop ever genuinely
+  stalls — a last-resort safety net for unattended operation, not expected
+  to fire in normal use.
+- WalterModem 1.5.0 has a real crash bug (unguarded null dereference in its
+  response parser, hit reproducibly under bursty NTRIP traffic) — vendored
+  locally with a fix rather than pulled from the registry; see
+  [lib/WalterModem/README-PATCH.md](lib/WalterModem/README-PATCH.md).
+- SD card mount currently fails (`0x107`) on the physical carrier board —
+  suspected missing/insufficient pull-up on the D3 line (see the comment in
+  `pins.h`); needs hardware inspection, not a firmware fix.
+- `secrets.h` is git-ignored; only `secrets.h.example` (with placeholder
+  values) is committed.
