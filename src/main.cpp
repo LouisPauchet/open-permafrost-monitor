@@ -1,64 +1,53 @@
 #include <Arduino.h>
-#include <esp_sleep.h>
 #include <esp_system.h>
+#include <esp_log.h>
+#include <string.h>
 
 #include "device_config.h"
+#include "field_service.h"
 #include "gnss.h"
+#include "geophone.h"
+#include "miniseed_writer.h"
+#include "sd_storage.h"
+#include "battery.h"
+#include "position_log.h"
 #include "modem.h"
 #include "ntrip_client.h"
 #include "mqtt_client.h"
-#include "sd_logger.h"
+#include "upload_client.h"
 
-// TODO(next stage): main.cpp is still the old deep-sleep-per-cycle shape
-// here - this is just the WiFi->cellular transport swap (stage a of the
-// field-deployment rewrite). It gets replaced by a persistent loop() once
-// the geophone module lands, since that needs the CPU continuously awake.
+// The default 8KB Arduino loop-task stack is too small for a TLS handshake
+// (WalterModem/mbedTLS) and crashes with a stack overflow at connect time.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
+// Continuous 24/7 geophone capture means the CPU can never deep-sleep (see
+// the plan) - loop() now runs forever, with each subsystem scheduled off
+// its own millis() timer instead of one wake/measure/sleep cycle per boot.
 
 static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
+static const unsigned long MINISEED_FLUSH_INTERVAL_MS = 5000;
+// Not user-configurable (kept out of the config menu per the "as few
+// parameters as possible" preference) - how often to wake the modem for a
+// batched MQTT publish, independent of the (usually shorter) GNSS fix
+// interval, so the modem doesn't need a fresh MQTT session every fix.
+static const unsigned long TELEMETRY_BATCH_INTERVAL_MS = 3600000UL; // 1 hour
 
-static void goToSleep() {
-  Serial.printf("Sleeping for %u s...\n", deviceConfig.measurement_interval_s);
-  Serial.flush();
-  esp_sleep_enable_timer_wakeup((uint64_t)deviceConfig.measurement_interval_s * 1000000ULL);
-  esp_deep_sleep_start();
-}
+static unsigned long lastFixCycleMs = 0;
+static unsigned long lastTelemetryMs = 0;
+static unsigned long lastMiniseedFlushMs = 0;
+static char lastUploadedDate[9] = "";
+static bool firstFixCycleDone = false;
 
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-
-  Serial.println(F("Walter <-> ZED-F9P RTK permafrost monitor"));
-
-  loadDeviceConfig();
-  initSDLogger(); // no-op today (no reader wired up yet); ready once it is
-
-  // Wake the F9P from UBX-RXM-PMREQ backup mode (harmless if it wasn't
-  // asleep, e.g. the very first boot ever) and give it a moment to come
-  // back up before talking to it over UART.
+static void runGnssFixCycle() {
   gnssWakeup();
-  delay(500);
+  geophoneAwareDelay(500);
   initGNSS();
 
-  esp_sleep_wakeup_cause_t wakeReason = esp_sleep_get_wakeup_cause();
-  bool wokeFromTimer = (wakeReason == ESP_SLEEP_WAKEUP_TIMER);
-  Serial.printf("Wake cause: %d (ESP_SLEEP_WAKEUP_TIMER=%d), reset reason: %d\n",
-                wakeReason, ESP_SLEEP_WAKEUP_TIMER, esp_reset_reason());
-
-  if (!modemInit()) {
-    Serial.println(F("Modem init failed - sleeping and retrying next cycle."));
-    gnssSleep();
-    goToSleep();
-    return;
+  bool ntripUp = false;
+  if (modemConnect()) {
+    ntripUp = ntripConnect();
   }
-
-  if (!modemConnect()) {
-    gnssSleep();
-    goToSleep();
-    return;
-  }
-
-  bool ntripOk = ntripConnect();
 
   Serial.printf("Waiting up to %u s for a fix with horizontal accuracy <= %.3f m...\n",
                 deviceConfig.fix_timeout_s, deviceConfig.good_accuracy_m);
@@ -69,9 +58,10 @@ void setup() {
   bool qualityOk = false;
 
   while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL) {
+    pollGeophone();
     pollGNSS();
 
-    if (ntripOk) {
+    if (ntripUp) {
       ntripPoll();
 
       unsigned long now = millis();
@@ -81,9 +71,9 @@ void setup() {
       }
     }
 
-    // The GST-enable command sent in initGNSS() can land before the F9P is
-    // ready to process it, especially right after an EXTINT wake from
-    // backup mode - keep retrying until GST sentences are actually flowing.
+    // The GST-enable command can land before the F9P is ready to process
+    // it, especially right after an EXTINT wake from backup mode - keep
+    // retrying until GST sentences are actually flowing.
     if (!gnssHasAccuracyEstimate() && millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
       lastGstEnableRetry = millis();
       gnssEnableGST();
@@ -108,19 +98,136 @@ void setup() {
   }
   Serial.printf("RTCM bytes forwarded: %u\n", ntripBytesForwarded());
 
-  if (mqttConnectBroker()) {
-    mqttPublishPosition(qualityOk);
-    mqttDisconnectBroker();
-  }
+  positionLogAppend(qualityOk, batteryExternalVoltage(), batteryInternalVoltage());
 
   ntripDisconnect();
-  closeSDLogger();
   gnssSleep();
+}
 
-  goToSleep();
+static void runTelemetryBatch() {
+  static char payload[2048];
+  size_t rows = positionLogReadUnsent(payload, sizeof(payload));
+  if (rows == 0) {
+    return;
+  }
+
+  if (!modemConnect()) {
+    Serial.println(F("Telemetry: modem not connected, skipping this batch."));
+    return;
+  }
+
+  if (mqttConnectBroker()) {
+    if (mqttPublishBatch(payload, rows)) {
+      positionLogMarkSent();
+    }
+    mqttDisconnectBroker();
+  }
+}
+
+static void runDailyUploadIfNeeded() {
+  if (!gnssHasDateTime()) {
+    return;
+  }
+
+  char today[9];
+  gnssDateString(today, sizeof(today));
+
+  if (lastUploadedDate[0] == '\0') {
+    // First time we've known the date this boot - nothing "yesterday" to
+    // upload yet, just remember today so we upload once it rolls over.
+    strncpy(lastUploadedDate, today, sizeof(lastUploadedDate) - 1);
+    return;
+  }
+
+  if (strcmp(today, lastUploadedDate) == 0) {
+    return; // still the same day
+  }
+
+  Serial.printf("Date rolled over (%s -> %s) - uploading yesterday's files.\n", lastUploadedDate, today);
+
+  if (!modemConnect()) {
+    Serial.println(F("Daily upload: modem not connected, will retry next loop."));
+    return; // don't advance lastUploadedDate - retry until it actually uploads
+  }
+
+  static const char *prefixes[] = {"geophone", "gnss_raw", "ntrip", "positions"};
+  static const char *exts[] = {"mseed", "log", "log", "csv"};
+  for (int i = 0; i < 4; i++) {
+    char localPath[48];
+    sdBuildDailyPath(localPath, sizeof(localPath), prefixes[i], lastUploadedDate, exts[i]);
+    char remoteName[64];
+    snprintf(remoteName, sizeof(remoteName), "%s_%s.%s", prefixes[i], lastUploadedDate, exts[i]);
+    uploadFile(localPath, remoteName);
+  }
+
+  strncpy(lastUploadedDate, today, sizeof(lastUploadedDate) - 1);
+}
+
+void setup() {
+  Serial.begin(115200);
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 3000) {
+    delay(10); // give the USB CDC host a moment to enumerate; don't hang forever if unplugged
+  }
+  delay(200);
+
+  Serial.println(F("Walter <-> ZED-F9P + RS3D permafrost/seismic field station"));
+
+  // Belt-and-suspenders alongside the CORE_DEBUG_LEVEL build flag: makes
+  // WalterModem's AT command TX/RX trace (ESP_LOGD("WalterModem", ...))
+  // visible regardless of whatever default the Arduino core startup set.
+  esp_log_level_set("WalterModem", ESP_LOG_DEBUG);
+
+  loadDeviceConfig();
+
+  sdStorageInit();
+  initBattery();
+  initPositionLog();
+
+  initGeophone();
+  initMiniseedWriter();
+
+  gnssWakeup();
+  delay(500);
+  initGNSS();
+  gnssSleep(); // idle until the first fix cycle in loop()
+
+  if (fieldModeRequested()) {
+    runFieldService();
+  }
+
+  if (!modemInit()) {
+    Serial.println(F("Modem init failed - modemConnect() will keep retrying each cycle."));
+  }
 }
 
 void loop() {
-  // Never reached: setup() always ends in deep sleep, which restarts
-  // execution from setup() on wake.
+  // Highest priority: the geophone digitizer streams continuously and
+  // never pauses, so this must run every iteration.
+  pollGeophone();
+  pollGNSS();
+
+  // Lets a technician trigger field service mode just by plugging in the
+  // service cable, no physical reset needed - see field_service.h.
+  checkFieldModeTrigger();
+
+  unsigned long now = millis();
+
+  if (now - lastMiniseedFlushMs >= MINISEED_FLUSH_INTERVAL_MS) {
+    lastMiniseedFlushMs = now;
+    miniseedFlush();
+  }
+
+  if (!firstFixCycleDone || now - lastFixCycleMs >= deviceConfig.measurement_interval_s * 1000UL) {
+    firstFixCycleDone = true;
+    lastFixCycleMs = now;
+    runGnssFixCycle();
+  }
+
+  if (now - lastTelemetryMs >= TELEMETRY_BATCH_INTERVAL_MS) {
+    lastTelemetryMs = now;
+    runTelemetryBatch();
+  }
+
+  runDailyUploadIfNeeded();
 }
