@@ -2,6 +2,7 @@
 #include "device_config.h"
 #include "modem.h"
 #include <SD_MMC.h>
+#include <esp_task_wdt.h>
 
 static const size_t CHUNK_SIZE = 32768; // comfortably under httpSend's 65535-byte cap
 
@@ -30,6 +31,12 @@ bool uploadFile(const char *localPath, const char *remoteFilename) {
 
   bool ok = true;
   for (size_t part = 0; part < totalParts && ok; part++) {
+    // A full day's file can be thousands of parts - without this, the task
+    // watchdog (see main.cpp) would only ever get fed once, at the top of
+    // the loop() iteration that kicked off this whole multi-part upload,
+    // and falsely reboot the device mid-transfer.
+    esp_task_wdt_reset();
+
     size_t n = f.read(chunk, CHUNK_SIZE);
 
     char path[192];

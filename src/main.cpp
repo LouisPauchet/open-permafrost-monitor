@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <esp_system.h>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
 #include <string.h>
 
 #include "device_config.h"
@@ -33,6 +34,16 @@ static const unsigned long MINISEED_FLUSH_INTERVAL_MS = 5000;
 // interval, so the modem doesn't need a fresh MQTT session every fix.
 static const unsigned long TELEMETRY_BATCH_INTERVAL_MS = 3600000UL; // 1 hour
 
+// Safety net for unattended field operation: if loop() (or anything it
+// blocks in) doesn't feed this for WATCHDOG_TIMEOUT_S, the ESP32 reboots
+// itself rather than sitting stuck until someone physically power-cycles
+// it. Set above WalterModem's own internal AT command timeout (180s,
+// WALTER_MODEM_CMD_TIMEOUT_MS in the library) with margin, so a genuinely
+// wedged modem command - which live hardware has hit at least once, see
+// drainSocketRing() in modem.cpp - reboots the device instead of stalling
+// it indefinitely if the library's own timeout doesn't recover it.
+static const uint32_t WATCHDOG_TIMEOUT_S = 210;
+
 static unsigned long lastFixCycleMs = 0;
 static unsigned long lastTelemetryMs = 0;
 static unsigned long lastMiniseedFlushMs = 0;
@@ -58,6 +69,7 @@ static void runGnssFixCycle() {
   bool qualityOk = false;
 
   while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL) {
+    esp_task_wdt_reset();
     pollGeophone();
     pollGNSS();
 
@@ -210,12 +222,21 @@ void setup() {
     runFieldService();
   }
 
+  // Subscribed only for normal operation, after the field-service check
+  // above: that console can legitimately sit idle for minutes waiting on a
+  // technician's keystrokes, which would otherwise look like a hang and
+  // trigger an unwanted reboot mid-configuration.
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
+
   if (!modemInit()) {
     Serial.println(F("Modem init failed - modemConnect() will keep retrying each cycle."));
   }
 }
 
 void loop() {
+  esp_task_wdt_reset();
+
   // Highest priority: the geophone digitizer streams continuously and
   // never pauses, so this must run every iteration.
   pollGeophone();

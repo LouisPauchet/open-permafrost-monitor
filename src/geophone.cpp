@@ -3,6 +3,7 @@
 #include "miniseed_writer.h"
 #include <ArduinoJson.h>
 #include <stdlib.h>
+#include <esp_task_wdt.h>
 
 static HardwareSerial GeophoneSerial(1);
 
@@ -51,6 +52,7 @@ void geophoneAwareDelay(unsigned long ms) {
   unsigned long start = millis();
   do {
     pollGeophone();
+    esp_task_wdt_reset();
     delay(10);
   } while (millis() - start < ms);
 }
