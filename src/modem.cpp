@@ -2,7 +2,8 @@
 #include "isrg_root_x1.h"
 #include "geophone.h"
 #include <WalterModem.h>
-#include <esp_task_wdt.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <string.h>
 
 static WalterModem modem;
@@ -17,23 +18,14 @@ static const int MODEM_HTTP_PROFILE = 1;
 // socketReceive is delivered via the WALTER_MODEM_SOCKET_EVENT_RING event,
 // not a polled available()/read() pair like WiFiClient - this buffer bridges
 // the two so ntrip_client.cpp can keep a simple polling-style read loop.
-// Not thread-safe against true concurrent access; fine here since nothing
-// else touches it between loop() iterations.
+// Touched from two different tasks now (see the async receive design
+// below), so access is guarded by socketRxMutex rather than the old
+// single-task assumption.
 static uint8_t socketRxBuf[4096];
 static size_t socketRxLen = 0;
+static SemaphoreHandle_t socketRxMutex = nullptr; // created in modemInit(), after the scheduler is up
 
-// Set by the RING event, cleared by drainSocketRing() - just a flag, no AT
-// command issued here. WalterModem's command pipeline (_cmdProcessingTask /
-// _curCmd) isn't safe against two tasks submitting blocking commands at
-// once: this handler runs on the library's own _eventProcessingTask, while
-// the main loop concurrently issues its own blocking commands (e.g. GGA
-// sends). Calling modem.socketReceive() - itself a blocking AT command -
-// directly from here raced against that and crashed the library
-// (_finishModemCMD dereferencing a stale/freed command pointer after a
-// stray response landed with no matching command outstanding). Deferring
-// the actual receive to drainSocketRing(), only ever called from
-// modemSocketAvailable() on the main Arduino task, keeps every blocking AT
-// command on one task.
+// Set by the RING event - just a flag, no AT command issued here.
 static volatile bool socketRingPending = false;
 
 static void socketEventHandler(WMSocketEventType event, const WMSocketEventData *data, void *args) {
@@ -42,61 +34,104 @@ static void socketEventHandler(WMSocketEventType event, const WMSocketEventData 
   }
 }
 
-// data_len on the RING event isn't reliable here: this firmware's
-// +SQNSRING URC carries only the socket id, no length (confirmed via AT
-// log - plain "+SQNSRING: 1", not "+SQNSRING: 1,<n>"), so it comes through
-// as 0 - requesting 0 bytes ("AT+SQNSRECV=1,0") gets "+CME ERROR: 50"
-// (incorrect parameters). Always ask for the max instead, and use the
-// response's own bytesReceived to know how much of the buffer is actually
-// valid.
+// --- Async socket receive ---
 //
-// A previous version of this function added a chunk-size cut and a 50ms
-// pacing gap between drains, guessing that hammering the AT channel less
-// hard would help. Live hardware showed the opposite: after a ~10s network
-// lull, several +SQNSRING notifications arrived within milliseconds of
-// each other, and WalterModem started logging "No free buffers"
-// (WalterModem.h: WALTER_MODEM_BUFFER_POOL_SIZE = 8, a fixed pool - every
-// queued line, including plain URCs, holds one slot until
-// _cmdProcessingTask processes it). Draining slowly just let that backlog
-// build past 8 before we could catch up. This drains everything pending in
-// one go instead - request the real max (1500) and keep going as long as
-// a read comes back full (strong signal more is still buffered), so a
-// burst gets consumed as fast as the AT channel allows rather than
-// trickling out one small read per outer-loop pass. Still bounded (maxLoops)
-// and still polls the geophone/watchdog between reads, since a large catch
-// -up can span several real round-trips.
-static void drainSocketRing() {
-  const int maxLoops = 16; // safety cap, not expected to be hit in practice
-  for (int i = 0; socketRingPending && i < maxLoops; i++) {
-    socketRingPending = false;
+// Went through three prior designs, each fixed by live hardware testing:
+// (1) call the blocking modem.socketReceive() straight from
+//     socketEventHandler() - crashed, because that handler runs on
+//     WalterModem's _eventProcessingTask while the main loop concurrently
+//     issues its own blocking commands (e.g. GGA sends), and the library's
+//     command pipeline isn't safe against two tasks submitting blocking
+//     commands at once.
+// (2) move the blocking call onto the main loop task only, with small
+//     chunks and a pacing gap between calls - fixed the crash, but under a
+//     burst (the caster's periodic antenna/receiver metadata resend, RTCM
+//     1007/1008/1033) the AT channel couldn't drain fast enough and
+//     WalterModem's fixed 8-slot buffer pool ("No free buffers") and
+//     command pool both got exhausted.
+// (3) drain aggressively instead (max chunk size, loop while reads come
+//     back full) - this genuinely helped and is still how a normal burst
+//     gets consumed, but occasionally a single AT+SQNSRECV command still
+//     gets "lost" inside the library: no "Command time-out" warning ever
+//     appears (confirmed on live hardware, the entire gap between the
+//     stall and our own watchdog firing), meaning the library's own 180s
+//     timeout never even sees it. A *blocking* call has no recourse then
+//     except our watchdog - which reboots the device and throws away the
+//     whole in-progress fix cycle, exactly when NTRIP corrections matter
+//     most.
+//
+// This design accepts that a command can be lost and stops blocking on it
+// at all: kick off one receive with a callback and return immediately.
+// GNSS/geophone/everything else keeps running untouched whether or not
+// that specific callback ever fires. A request left outstanding too long
+// is abandoned (asyncGeneration bumped) so a fresh one can be issued; a
+// stale callback firing later is recognized via the generation tag and
+// ignored, so it can never write into a buffer a newer request now owns.
+static uint8_t asyncChunk[1500];
+static WalterModemRsp asyncRsp;
+static volatile bool asyncReceiveInFlight = false;
+static unsigned long asyncReceiveStartMs = 0;
+static volatile uint32_t asyncGeneration = 0;
+static const unsigned long ASYNC_RECEIVE_ABANDON_MS = 5000;
 
-    uint8_t chunk[1500];
-    WalterModemRsp rsp;
-    if (!modem.socketReceive(MODEM_SOCKET_ID, chunk, sizeof(chunk), &rsp)) {
-      return;
-    }
+static void onSocketReceiveComplete(const WalterModemRsp *rsp, void *args) {
+  uint32_t completedGeneration = (uint32_t)(uintptr_t)args;
+  if (completedGeneration != asyncGeneration) {
+    return; // abandoned already - a newer request may now own asyncChunk
+  }
+  asyncReceiveInFlight = false;
 
-    uint16_t n = rsp.data.socketResponse.bytesReceived;
-    if (n == 0) {
-      return; // nothing received
-    }
-    if (socketRxLen + n > sizeof(socketRxBuf)) {
-      return; // drop if the consumer isn't keeping up
-    }
+  if (rsp->result != WALTER_MODEM_STATE_OK) {
+    return;
+  }
 
-    memcpy(socketRxBuf + socketRxLen, chunk, n);
+  // data_len on the RING event isn't reliable here: this firmware's
+  // +SQNSRING URC carries only the socket id, no length (confirmed via AT
+  // log - plain "+SQNSRING: 1", not "+SQNSRING: 1,<n>"), so it comes
+  // through as 0 - requesting 0 bytes ("AT+SQNSRECV=1,0") gets
+  // "+CME ERROR: 50". Always ask for the max instead (see drainSocketRing)
+  // and use the response's own bytesReceived to know how much landed.
+  uint16_t n = rsp->data.socketResponse.bytesReceived;
+  if (n == 0) {
+    return;
+  }
+
+  xSemaphoreTake(socketRxMutex, portMAX_DELAY);
+  if (socketRxLen + n <= sizeof(socketRxBuf)) {
+    memcpy(socketRxBuf + socketRxLen, asyncChunk, n);
     socketRxLen += n;
+  } // else drop - the consumer isn't keeping up
+  xSemaphoreGive(socketRxMutex);
 
-    pollGeophone();
-    esp_task_wdt_reset();
-
-    if (n < sizeof(chunk)) {
-      return; // got less than the max - modem's buffer is empty for now
-    }
-    // Got a full chunk back - more is very likely still queued at the
-    // modem, loop again immediately even if socketRingPending hasn't been
-    // re-set yet by a fresh RING.
+  if (n == sizeof(asyncChunk)) {
+    // Got a full chunk - more is very likely still queued at the modem.
     socketRingPending = true;
+  }
+}
+
+// Called from the main loop only (modemSocketAvailable()/Read()) - kicks
+// off at most one async receive per call, never blocks.
+static void drainSocketRing() {
+  if (asyncReceiveInFlight) {
+    if (millis() - asyncReceiveStartMs > ASYNC_RECEIVE_ABANDON_MS) {
+      asyncReceiveInFlight = false;
+      asyncGeneration++;
+    } else {
+      return; // still within the normal grace period, keep waiting
+    }
+  }
+
+  if (!socketRingPending) {
+    return;
+  }
+  socketRingPending = false;
+
+  asyncReceiveInFlight = true;
+  asyncReceiveStartMs = millis();
+  uint32_t myGeneration = asyncGeneration;
+  if (!modem.socketReceive(MODEM_SOCKET_ID, asyncChunk, sizeof(asyncChunk), &asyncRsp,
+                            onSocketReceiveComplete, (void *)(uintptr_t)myGeneration)) {
+    asyncReceiveInFlight = false; // couldn't even queue the command - try again next call
   }
 }
 
@@ -111,6 +146,8 @@ static bool isRegistered(WalterModemNetworkRegState state) {
 }
 
 bool modemInit() {
+  socketRxMutex = xSemaphoreCreateMutex();
+
   // The Sequans modem chip needs real boot time after power-on before it
   // reliably answers AT commands - the reference WalterModem examples all
   // wait 2s before the first call. Without this, setOpState() calls can
@@ -197,8 +234,15 @@ bool modemIsConnected() {
 }
 
 bool modemSocketOpen(const char *host, uint16_t port) {
+  xSemaphoreTake(socketRxMutex, portMAX_DELAY);
   socketRxLen = 0;
+  xSemaphoreGive(socketRxMutex);
   socketRingPending = false;
+  // Abandon (don't wait for) any receive still outstanding from a previous
+  // socket session - its callback, if it ever fires, must not write into
+  // asyncChunk on behalf of this new one.
+  asyncReceiveInFlight = false;
+  asyncGeneration++;
 
   if (!modem.socketConfig(MODEM_SOCKET_ID, MODEM_PDP_CTX)) {
     Serial.println(F("Modem: socketConfig failed."));
@@ -219,7 +263,7 @@ bool modemSocketSend(const uint8_t *data, size_t len) {
 
 size_t modemSocketAvailable() {
   drainSocketRing();
-  return socketRxLen;
+  return socketRxLen; // single size_t read - a momentarily stale value just means "check again next call"
 }
 
 size_t modemSocketRead(uint8_t *buf, size_t maxLen) {
@@ -229,19 +273,25 @@ size_t modemSocketRead(uint8_t *buf, size_t maxLen) {
   // for first.
   drainSocketRing();
 
+  xSemaphoreTake(socketRxMutex, portMAX_DELAY);
   size_t n = maxLen < socketRxLen ? maxLen : socketRxLen;
   memcpy(buf, socketRxBuf, n);
   if (n < socketRxLen) {
     memmove(socketRxBuf, socketRxBuf + n, socketRxLen - n);
   }
   socketRxLen -= n;
+  xSemaphoreGive(socketRxMutex);
   return n;
 }
 
 void modemSocketClose() {
   modem.socketClose(MODEM_SOCKET_ID);
+  xSemaphoreTake(socketRxMutex, portMAX_DELAY);
   socketRxLen = 0;
+  xSemaphoreGive(socketRxMutex);
   socketRingPending = false;
+  asyncReceiveInFlight = false;
+  asyncGeneration++;
 }
 
 bool modemMqttConnect(const char *host, uint16_t port, const char *clientId,
