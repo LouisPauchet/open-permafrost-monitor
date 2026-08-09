@@ -1,6 +1,6 @@
 #include "gnss.h"
 #include "pins.h"
-#include "sd_logger.h"
+#include "sd_storage.h"
 #include <TinyGPSPlus.h>
 #include <string.h>
 #include <stdlib.h>
@@ -79,21 +79,57 @@ static bool haveGGA = false;
 static char lineBuf[100];
 static uint8_t lineLen = 0;
 
+// Daily-rotated raw NMEA+UBX capture (for PPK/PPP post-processing), only
+// meaningful once GNSS time is known (used for the filename date).
+static File rawLogFile;
+static char rawLogDate[9] = "";
+
+static void rawLogRotateIfNeeded() {
+  if (!sdStorageAvailable() || !gnssHasDateTime()) {
+    return;
+  }
+  char today[9];
+  gnssDateString(today, sizeof(today));
+  if (strcmp(today, rawLogDate) != 0) {
+    if (rawLogFile) {
+      rawLogFile.close();
+    }
+    char path[48];
+    sdBuildDailyPath(path, sizeof(path), "gnss_raw", today, "log");
+    rawLogFile = sdOpenForAppend(path);
+    strncpy(rawLogDate, today, sizeof(rawLogDate) - 1);
+  }
+}
+
 void gnssEnableGST() {
   GPSSerial.write(UBX_ENABLE_GST_UART1, sizeof(UBX_ENABLE_GST_UART1));
 }
 
-void initGNSS() {
-  GPSSerial.setRxBufferSize(1024);
-  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+// Safe to call once per boot only - HardwareSerial::setRxBufferSize()
+// throws an error if the UART is already running. The persistent main
+// loop calls initGNSS() once at startup; each subsequent wake cycle only
+// needs the message-enable resend below (backup mode can reset it), not a
+// fresh UART begin(), so that part is split into gnssReenableMessages().
+static bool uartStarted = false;
 
-  delay(100);
+void gnssReenableMessages() {
   gnssEnableGST();
 
-  if (sdLoggerAvailable()) {
+  if (sdStorageAvailable()) {
     GPSSerial.write(UBX_ENABLE_RAWX_UART1, sizeof(UBX_ENABLE_RAWX_UART1));
     GPSSerial.write(UBX_ENABLE_SFRBX_UART1, sizeof(UBX_ENABLE_SFRBX_UART1));
   }
+}
+
+void initGNSS() {
+  if (!uartStarted) {
+    GPSSerial.setRxBufferSize(1024);
+    GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    uartStarted = true;
+    delay(100);
+  }
+
+  gnssReenableMessages();
 }
 
 void gnssSleep() {
@@ -113,12 +149,16 @@ void gnssWakeup() {
 }
 
 void pollGNSS() {
+  rawLogRotateIfNeeded();
+
   while (GPSSerial.available() > 0) {
     char c = GPSSerial.read();
     if (DEBUG_PRINT_RAW_GNSS) {
       Serial.write(c);
     }
-    sdLogRawByte((uint8_t)c);
+    if (rawLogFile) {
+      rawLogFile.write((uint8_t)c);
+    }
     gps.encode(c);
 
     if (c == '\n') {
@@ -191,6 +231,18 @@ void gnssTimestamp(char *buf, size_t bufSize) {
            gps.date.year(), gps.date.month(), gps.date.day(),
            gps.time.hour(), gps.time.minute(), gps.time.second());
 }
+
+void gnssDateString(char *buf, size_t bufSize) {
+  snprintf(buf, bufSize, "%04d%02d%02d", gps.date.year(), gps.date.month(), gps.date.day());
+}
+
+uint16_t gnssYear() { return gps.date.year(); }
+uint8_t gnssMonth() { return gps.date.month(); }
+uint8_t gnssDay() { return gps.date.day(); }
+uint8_t gnssHour() { return gps.time.hour(); }
+uint8_t gnssMinute() { return gps.time.minute(); }
+uint8_t gnssSecond() { return gps.time.second(); }
+uint16_t gnssMillisecond() { return gps.time.centisecond() * 10; }
 
 const char *gnssLastGGA() {
   return haveGGA ? lastGGA : "";

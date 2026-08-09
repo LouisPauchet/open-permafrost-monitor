@@ -31,7 +31,15 @@ double gnssAltitude();
 uint32_t gnssSatellites();
 
 bool gnssHasDateTime();
-void gnssTimestamp(char *buf, size_t bufSize); // ISO8601 UTC
+void gnssTimestamp(char *buf, size_t bufSize);   // ISO8601 UTC
+void gnssDateString(char *buf, size_t bufSize);  // "YYYYMMDD" UTC, for daily filenames
+uint16_t gnssYear();
+uint8_t gnssMonth();
+uint8_t gnssDay();
+uint8_t gnssHour();
+uint8_t gnssMinute();
+uint8_t gnssSecond();
+uint16_t gnssMillisecond(); // sub-second, from TinyGPS++'s centisecond field
 
 const char *gnssLastGGA(); // raw $..GGA line as last seen from the module, "" if none yet
 uint32_t gnssCharsProcessed();
