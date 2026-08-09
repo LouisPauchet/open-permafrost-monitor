@@ -48,7 +48,12 @@ static String socketReadLine(unsigned long timeoutMs) {
   return line;
 }
 
-bool ntripConnect() {
+// Single connection attempt. *wasUnauthorized is set so the caller can
+// pick a shorter retry delay for a 401 - observed on this caster to often
+// be a transient rejection that a quick retry clears, not a genuine
+// credentials problem.
+static bool ntripConnectOnce(bool *wasUnauthorized) {
+  *wasUnauthorized = false;
   Serial.printf("Connecting to NTRIP caster %s:%d ...\n", deviceConfig.ntrip_host, deviceConfig.ntrip_port);
 
   if (!modemSocketOpen(deviceConfig.ntrip_host, deviceConfig.ntrip_port)) {
@@ -76,7 +81,12 @@ bool ntripConnect() {
   Serial.println(statusLine);
 
   if (statusLine.indexOf("200") < 0) {
-    Serial.println(F("NTRIP caster rejected request (check mountpoint/credentials)."));
+    if (statusLine.indexOf("401") >= 0) {
+      Serial.println(F("NTRIP caster returned 401 Unauthorized - retrying shortly (often transient)."));
+      *wasUnauthorized = true;
+    } else {
+      Serial.println(F("NTRIP caster rejected request (check mountpoint/credentials)."));
+    }
     modemSocketClose();
     return false;
   }
@@ -94,6 +104,31 @@ bool ntripConnect() {
   return true;
 }
 
+bool ntripConnect() {
+  static const int MAX_ATTEMPTS = 3;
+  static const unsigned long RETRY_DELAY_UNAUTHORIZED_MS = 5000;
+  static const unsigned long RETRY_DELAY_GENERAL_MS = 10000;
+
+  for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    bool wasUnauthorized = false;
+    if (ntripConnectOnce(&wasUnauthorized)) {
+      return true;
+    }
+
+    if (attempt == MAX_ATTEMPTS) {
+      break;
+    }
+
+    unsigned long delayMs = wasUnauthorized ? RETRY_DELAY_UNAUTHORIZED_MS : RETRY_DELAY_GENERAL_MS;
+    Serial.printf("NTRIP connect attempt %d/%d failed - retrying in %lus...\n", attempt, MAX_ATTEMPTS,
+                  delayMs / 1000);
+    geophoneAwareDelay(delayMs);
+  }
+
+  Serial.println(F("NTRIP connect: giving up for this fix cycle."));
+  return false;
+}
+
 bool ntripIsConnected() {
   return connected;
 }
@@ -109,12 +144,21 @@ void ntripPoll() {
   }
 }
 
-void ntripSendGGA(const char *ggaLine) {
+bool ntripSendGGA(const char *ggaLine) {
   if (!connected || ggaLine[0] == '\0') {
-    return;
+    return false;
+  }
+  // A send submitted while a receive is in flight was found to reliably
+  // collide on WalterModem's command channel and fail with "+CME ERROR:
+  // 4" - live hardware showed 100% of GGA sends failing this way. Defer
+  // rather than send into a near-certain failure; the caller retries soon
+  // without waiting a full resend interval.
+  if (modemReceiveBusy()) {
+    return false;
   }
   String line = String(ggaLine) + "\r\n";
   modemSocketSend((const uint8_t *)line.c_str(), line.length());
+  return true;
 }
 
 uint32_t ntripBytesForwarded() {
