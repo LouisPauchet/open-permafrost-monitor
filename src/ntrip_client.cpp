@@ -2,6 +2,7 @@
 #include "device_config.h"
 #include "gnss.h"
 #include "modem.h"
+#include "geophone.h"
 #include <string.h>
 
 static bool connected = false;
@@ -41,7 +42,7 @@ static String socketReadLine(unsigned long timeoutMs) {
         return line;
       }
     } else {
-      delay(10);
+      geophoneAwareDelay(10);
     }
   }
   return line;
