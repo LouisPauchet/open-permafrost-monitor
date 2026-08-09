@@ -94,8 +94,13 @@ static void runGnssFixCycle() {
 
       unsigned long now = millis();
       if (now - lastGgaSent >= GGA_RESEND_INTERVAL_MS) {
-        lastGgaSent = now;
-        ntripSendGGA(gnssLastGGA());
+        // Only reset the timer if the send actually happened - ntripSendGGA()
+        // defers (returns false) rather than send while a receive is in
+        // flight, and that should be retried on the very next iteration,
+        // not after a fresh full interval.
+        if (ntripSendGGA(gnssLastGGA())) {
+          lastGgaSent = now;
+        }
       }
     }
 

@@ -18,6 +18,13 @@ size_t modemSocketAvailable();
 size_t modemSocketRead(uint8_t *buf, size_t maxLen);
 void modemSocketClose();
 
+// True while an async socket receive is outstanding. A send submitted at
+// the same moment can collide with it on WalterModem's command channel
+// (see modem.cpp's async receive design notes) - callers with a send that
+// can wait a moment (e.g. ntripSendGGA's periodic GGA relay) should check
+// this and defer rather than risk it.
+bool modemReceiveBusy();
+
 // MQTT (used by mqtt_client.cpp for batched telemetry).
 bool modemMqttConnect(const char *host, uint16_t port, const char *clientId,
                        const char *user, const char *pass, const char *caCert);

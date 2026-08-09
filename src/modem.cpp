@@ -307,6 +307,10 @@ bool modemSocketSend(const uint8_t *data, size_t len) {
                            &sendRsp, onSocketSendComplete, nullptr);
 }
 
+bool modemReceiveBusy() {
+  return asyncReceiveInFlight;
+}
+
 size_t modemSocketAvailable() {
   drainSocketRing();
   return socketRxLen; // single size_t read - a momentarily stale value just means "check again next call"
