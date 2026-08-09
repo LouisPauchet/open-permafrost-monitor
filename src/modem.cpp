@@ -21,25 +21,41 @@ static const int MODEM_HTTP_PROFILE = 1;
 static uint8_t socketRxBuf[4096];
 static size_t socketRxLen = 0;
 
+// Set by the RING event, cleared by drainSocketRing() - just a flag, no AT
+// command issued here. WalterModem's command pipeline (_cmdProcessingTask /
+// _curCmd) isn't safe against two tasks submitting blocking commands at
+// once: this handler runs on the library's own _eventProcessingTask, while
+// the main loop concurrently issues its own blocking commands (e.g. GGA
+// sends). Calling modem.socketReceive() - itself a blocking AT command -
+// directly from here raced against that and crashed the library
+// (_finishModemCMD dereferencing a stale/freed command pointer after a
+// stray response landed with no matching command outstanding). Deferring
+// the actual receive to drainSocketRing(), only ever called from
+// modemSocketAvailable() on the main Arduino task, keeps every blocking AT
+// command on one task.
+static volatile bool socketRingPending = false;
+
 static void socketEventHandler(WMSocketEventType event, const WMSocketEventData *data, void *args) {
-  if (event != WALTER_MODEM_SOCKET_EVENT_RING) {
+  if (event == WALTER_MODEM_SOCKET_EVENT_RING) {
+    socketRingPending = true;
+  }
+}
+
+// data_len on the RING event isn't reliable here: this firmware's
+// +SQNSRING URC carries only the socket id, no length (confirmed via AT
+// log - plain "+SQNSRING: 1", not "+SQNSRING: 1,<n>"), so it comes through
+// as 0 - requesting 0 bytes ("AT+SQNSRECV=1,0") gets "+CME ERROR: 50"
+// (incorrect parameters). Always ask for the max instead, and use the
+// response's own bytesReceived to know how much of the buffer is actually
+// valid.
+static void drainSocketRing() {
+  if (!socketRingPending) {
     return;
   }
+  socketRingPending = false;
 
-  // data->data_len isn't reliable here: this firmware's +SQNSRING URC
-  // carries only the socket id, no length (confirmed via AT log - plain
-  // "+SQNSRING: 1", not "+SQNSRING: 1,<n>"), so it comes through as 0 -
-  // requesting 0 bytes ("AT+SQNSRECV=1,0") gets "+CME ERROR: 50" (incorrect
-  // parameters). Always ask for the max instead, and use the response's
-  // own bytesReceived to know how much of the buffer is actually valid.
-  //
-  // static, not stack-local: this callback runs on uart_event_task, an
-  // internal FreeRTOS task with a small fixed stack - a 1500-byte buffer
-  // plus WalterModemRsp (a fairly large struct) as locals blew its stack
-  // canary and crashed the whole device. Static moves them out of the
-  // stack entirely; safe since this handler only ever runs one at a time.
-  static uint8_t chunk[1500];
-  static WalterModemRsp rsp;
+  uint8_t chunk[1500];
+  WalterModemRsp rsp;
   if (!modem.socketReceive(MODEM_SOCKET_ID, chunk, sizeof(chunk), &rsp)) {
     return;
   }
@@ -151,6 +167,7 @@ bool modemIsConnected() {
 
 bool modemSocketOpen(const char *host, uint16_t port) {
   socketRxLen = 0;
+  socketRingPending = false;
 
   if (!modem.socketConfig(MODEM_SOCKET_ID, MODEM_PDP_CTX)) {
     Serial.println(F("Modem: socketConfig failed."));
@@ -170,6 +187,7 @@ bool modemSocketSend(const uint8_t *data, size_t len) {
 }
 
 size_t modemSocketAvailable() {
+  drainSocketRing();
   return socketRxLen;
 }
 
@@ -186,6 +204,7 @@ size_t modemSocketRead(uint8_t *buf, size_t maxLen) {
 void modemSocketClose() {
   modem.socketClose(MODEM_SOCKET_ID);
   socketRxLen = 0;
+  socketRingPending = false;
 }
 
 bool modemMqttConnect(const char *host, uint16_t port, const char *clientId,
