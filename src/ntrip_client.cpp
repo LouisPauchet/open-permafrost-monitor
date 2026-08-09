@@ -105,8 +105,20 @@ static bool ntripConnectOnce(bool *wasUnauthorized) {
 }
 
 bool ntripConnect() {
-  static const int MAX_ATTEMPTS = 3;
-  static const unsigned long RETRY_DELAY_UNAUTHORIZED_MS = 5000;
+  // A 401 on this caster isn't a real credentials problem - confirmed by
+  // the user restarting and having it work again shortly after - but 3
+  // retries at a flat 5s (10s total) wasn't long enough: live hardware hit
+  // 401 on all 3 attempts in a row. This looks like caster-side session
+  // state (e.g. a previous connection not yet timed out server-side)
+  // needing real wall-clock time to clear, not something a quick retry
+  // fixes. Widened the budget and made the delay increase each attempt,
+  // so a slow-to-clear session gets a real chance without permanently
+  // blocking the fix cycle - worst case (5 attempts, all 401) is 5+15+30+45
+  // = 95s of retrying, still leaving the GNSS fix-wait loop's own timeout
+  // as the outer bound. A non-401 failure keeps a fixed, shorter delay -
+  // no evidence it needs the same treatment.
+  static const int MAX_ATTEMPTS = 5;
+  static const unsigned long RETRY_DELAY_UNAUTHORIZED_MS[MAX_ATTEMPTS - 1] = {5000, 15000, 30000, 45000};
   static const unsigned long RETRY_DELAY_GENERAL_MS = 10000;
 
   for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -119,7 +131,7 @@ bool ntripConnect() {
       break;
     }
 
-    unsigned long delayMs = wasUnauthorized ? RETRY_DELAY_UNAUTHORIZED_MS : RETRY_DELAY_GENERAL_MS;
+    unsigned long delayMs = wasUnauthorized ? RETRY_DELAY_UNAUTHORIZED_MS[attempt - 1] : RETRY_DELAY_GENERAL_MS;
     Serial.printf("NTRIP connect attempt %d/%d failed - retrying in %lus...\n", attempt, MAX_ATTEMPTS,
                   delayMs / 1000);
     geophoneAwareDelay(delayMs);
