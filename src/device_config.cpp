@@ -28,6 +28,10 @@ static void applyDefaults() {
   deviceConfig.measurement_interval_s = 600; // 10 minutes
   deviceConfig.fix_timeout_s = 120;          // give up after 2 minutes if not "good"
   deviceConfig.good_accuracy_m = 0.05f;      // 5 cm
+
+  copyField(deviceConfig.upload_host, sizeof(deviceConfig.upload_host), UPLOAD_HOST);
+  deviceConfig.upload_port = UPLOAD_PORT;
+  copyField(deviceConfig.upload_api_key, sizeof(deviceConfig.upload_api_key), UPLOAD_API_KEY);
 }
 
 void loadDeviceConfig() {
@@ -56,8 +60,12 @@ void loadDeviceConfig() {
     loaded.fix_timeout_s = prefs.getUInt("timeout_s", loaded.fix_timeout_s);
     loaded.good_accuracy_m = prefs.getFloat("accuracy_m", loaded.good_accuracy_m);
 
+    prefs.getString("upload_host", loaded.upload_host, sizeof(loaded.upload_host));
+    loaded.upload_port = prefs.getUShort("upload_port", loaded.upload_port);
+    prefs.getString("upload_key", loaded.upload_api_key, sizeof(loaded.upload_api_key));
+
     // Guard against a previously-saved blank/corrupt entry (see
-    // config_portal.cpp for how this is now prevented going forward) -
+    // field_service.cpp for how this is now prevented going forward) -
     // fall back to the compiled-in defaults instead of running with
     // empty hosts / a zero measurement interval.
     bool looksValid = strlen(loaded.mqtt_host) > 0 && strlen(loaded.ntrip_host) > 0 &&
@@ -94,5 +102,9 @@ void saveDeviceConfig() {
   prefs.putUInt("interval_s", deviceConfig.measurement_interval_s);
   prefs.putUInt("timeout_s", deviceConfig.fix_timeout_s);
   prefs.putFloat("accuracy_m", deviceConfig.good_accuracy_m);
+
+  prefs.putString("upload_host", deviceConfig.upload_host);
+  prefs.putUShort("upload_port", deviceConfig.upload_port);
+  prefs.putString("upload_key", deviceConfig.upload_api_key);
   prefs.end();
 }
