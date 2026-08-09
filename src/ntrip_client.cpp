@@ -174,8 +174,22 @@ bool ntripSendGGA(const char *ggaLine) {
   // this check and the actual send. Claim the channel for a brief window
   // so no *new* receive starts during it.
   modemSuppressReceiveFor(300);
-  String line = String(ggaLine) + "\r\n";
-  modemSocketSend((const uint8_t *)line.c_str(), line.length());
+  // A heap-allocated String here (this function runs often, given how much
+  // retry logic surrounds it) fragmented the heap badly enough on live
+  // hardware to trip ESP32's heap-poisoning check and crash
+  // ("CORRUPT HEAP: Bad tail", inside a later, unrelated String's
+  // destructor) - a stack buffer + snprintf has no allocation to
+  // fragment. gnssLastGGA()'s buffer is 100 bytes (99 chars + NUL); +2 for
+  // "\r\n" +1 for NUL.
+  char line[102];
+  int len = snprintf(line, sizeof(line), "%s\r\n", ggaLine);
+  if (len <= 0) {
+    return false;
+  }
+  if ((size_t)len >= sizeof(line)) {
+    len = sizeof(line) - 1; // truncated - still send what fits rather than nothing
+  }
+  modemSocketSend((const uint8_t *)line, (size_t)len);
   return true;
 }
 
