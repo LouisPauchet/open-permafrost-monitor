@@ -2,6 +2,7 @@
 #include "isrg_root_x1.h"
 #include "geophone.h"
 #include <WalterModem.h>
+#include <esp_task_wdt.h>
 #include <string.h>
 
 static WalterModem modem;
@@ -49,44 +50,54 @@ static void socketEventHandler(WMSocketEventType event, const WMSocketEventData 
 // response's own bytesReceived to know how much of the buffer is actually
 // valid.
 //
-// Chunk size deliberately smaller than the modem's real max (1500): during
-// a sustained RTCM burst, RING events can fire faster than one round-trip
-// takes, so ntripPoll()'s drain loop re-enters this function back-to-back
-// with ~zero gap. Live hardware hit a run where the modem then answered
-// several AT+SQNSRECV calls with unsolicited "+CME ERROR: 4" (no request
-// from us matched to them - a response-tracking desync in the modem/
-// library, not our command). A smaller request shortens each round-trip;
-// minDrainGapMs adds a deliberate breathing gap between them. Neither is a
-// proven fix for the underlying desync, just a reduction in how hard we
-// hammer the AT channel - see the task watchdog added in main.cpp for the
-// actual safety net (self-reboot) if a stall happens anyway.
+// A previous version of this function added a chunk-size cut and a 50ms
+// pacing gap between drains, guessing that hammering the AT channel less
+// hard would help. Live hardware showed the opposite: after a ~10s network
+// lull, several +SQNSRING notifications arrived within milliseconds of
+// each other, and WalterModem started logging "No free buffers"
+// (WalterModem.h: WALTER_MODEM_BUFFER_POOL_SIZE = 8, a fixed pool - every
+// queued line, including plain URCs, holds one slot until
+// _cmdProcessingTask processes it). Draining slowly just let that backlog
+// build past 8 before we could catch up. This drains everything pending in
+// one go instead - request the real max (1500) and keep going as long as
+// a read comes back full (strong signal more is still buffered), so a
+// burst gets consumed as fast as the AT channel allows rather than
+// trickling out one small read per outer-loop pass. Still bounded (maxLoops)
+// and still polls the geophone/watchdog between reads, since a large catch
+// -up can span several real round-trips.
 static void drainSocketRing() {
-  if (!socketRingPending) {
-    return;
+  const int maxLoops = 16; // safety cap, not expected to be hit in practice
+  for (int i = 0; socketRingPending && i < maxLoops; i++) {
+    socketRingPending = false;
+
+    uint8_t chunk[1500];
+    WalterModemRsp rsp;
+    if (!modem.socketReceive(MODEM_SOCKET_ID, chunk, sizeof(chunk), &rsp)) {
+      return;
+    }
+
+    uint16_t n = rsp.data.socketResponse.bytesReceived;
+    if (n == 0) {
+      return; // nothing received
+    }
+    if (socketRxLen + n > sizeof(socketRxBuf)) {
+      return; // drop if the consumer isn't keeping up
+    }
+
+    memcpy(socketRxBuf + socketRxLen, chunk, n);
+    socketRxLen += n;
+
+    pollGeophone();
+    esp_task_wdt_reset();
+
+    if (n < sizeof(chunk)) {
+      return; // got less than the max - modem's buffer is empty for now
+    }
+    // Got a full chunk back - more is very likely still queued at the
+    // modem, loop again immediately even if socketRingPending hasn't been
+    // re-set yet by a fresh RING.
+    socketRingPending = true;
   }
-
-  static unsigned long lastDrainMs = 0;
-  const unsigned long minDrainGapMs = 50;
-  if (millis() - lastDrainMs < minDrainGapMs) {
-    return; // leave socketRingPending set - try again next call
-  }
-
-  socketRingPending = false;
-  lastDrainMs = millis();
-
-  uint8_t chunk[512];
-  WalterModemRsp rsp;
-  if (!modem.socketReceive(MODEM_SOCKET_ID, chunk, sizeof(chunk), &rsp)) {
-    return;
-  }
-
-  uint16_t n = rsp.data.socketResponse.bytesReceived;
-  if (n == 0 || socketRxLen + n > sizeof(socketRxBuf)) {
-    return; // nothing received, or drop if the consumer isn't keeping up
-  }
-
-  memcpy(socketRxBuf + socketRxLen, chunk, n);
-  socketRxLen += n;
 }
 
 static bool isRegistered(WalterModemNetworkRegState state) {
