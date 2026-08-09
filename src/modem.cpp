@@ -1,5 +1,6 @@
 #include "modem.h"
 #include "isrg_root_x1.h"
+#include "geophone.h"
 #include <WalterModem.h>
 #include <string.h>
 
@@ -24,15 +25,32 @@ static void socketEventHandler(WMSocketEventType event, const WMSocketEventData 
   if (event != WALTER_MODEM_SOCKET_EVENT_RING) {
     return;
   }
-  if (socketRxLen + data->data_len > sizeof(socketRxBuf)) {
-    return; // drop if the consumer isn't keeping up; avoids overflow
+
+  // data->data_len isn't reliable here: this firmware's +SQNSRING URC
+  // carries only the socket id, no length (confirmed via AT log - plain
+  // "+SQNSRING: 1", not "+SQNSRING: 1,<n>"), so it comes through as 0 -
+  // requesting 0 bytes ("AT+SQNSRECV=1,0") gets "+CME ERROR: 50" (incorrect
+  // parameters). Always ask for the max instead, and use the response's
+  // own bytesReceived to know how much of the buffer is actually valid.
+  //
+  // static, not stack-local: this callback runs on uart_event_task, an
+  // internal FreeRTOS task with a small fixed stack - a 1500-byte buffer
+  // plus WalterModemRsp (a fairly large struct) as locals blew its stack
+  // canary and crashed the whole device. Static moves them out of the
+  // stack entirely; safe since this handler only ever runs one at a time.
+  static uint8_t chunk[1500];
+  static WalterModemRsp rsp;
+  if (!modem.socketReceive(MODEM_SOCKET_ID, chunk, sizeof(chunk), &rsp)) {
+    return;
   }
-  uint8_t chunk[1500];
-  uint16_t toRead = data->data_len > sizeof(chunk) ? sizeof(chunk) : data->data_len;
-  if (modem.socketReceive(MODEM_SOCKET_ID, chunk, toRead)) {
-    memcpy(socketRxBuf + socketRxLen, chunk, toRead);
-    socketRxLen += toRead;
+
+  uint16_t n = rsp.data.socketResponse.bytesReceived;
+  if (n == 0 || socketRxLen + n > sizeof(socketRxBuf)) {
+    return; // nothing received, or drop if the consumer isn't keeping up
   }
+
+  memcpy(socketRxBuf + socketRxLen, chunk, n);
+  socketRxLen += n;
 }
 
 static bool isRegistered(WalterModemNetworkRegState state) {
@@ -46,21 +64,45 @@ static bool isRegistered(WalterModemNetworkRegState state) {
 }
 
 bool modemInit() {
+  // The Sequans modem chip needs real boot time after power-on before it
+  // reliably answers AT commands - the reference WalterModem examples all
+  // wait 2s before the first call. Without this, setOpState() calls can
+  // silently succeed on a not-yet-ready modem while definePDPContext()
+  // (which needs the SIM to have settled) fails right after.
+  geophoneAwareDelay(2000);
+
   if (!modem.begin(&Serial2)) {
     Serial.println(F("Modem: begin() failed."));
     return false;
   }
-
-  modem.setOpState(WALTER_MODEM_OPSTATE_MINIMUM);
 
   if (!modem.setOpState(WALTER_MODEM_OPSTATE_NO_RF)) {
     Serial.println(F("Modem: setOpState(NO_RF) failed."));
     return false;
   }
 
-  if (!modem.definePDPContext(MODEM_PDP_CTX)) {
-    Serial.println(F("Modem: definePDPContext failed."));
-    return false;
+  // AT+CGDCONT? confirmed context 1 is already defined in the modem's own
+  // non-volatile memory as type "IP" ("+CGDCONT: 1,\"IP\",\"\",,,,0,...") -
+  // this board carries state from prior testing (e.g. open_renewable_lab).
+  // Every attempt to redefine it got "+CME ERROR: 4" (operation not
+  // supported) - including re-sending the *exact same* "IP" value already
+  // stored, which rules out the specific type/value as the cause. This
+  // firmware rejects touching an already-defined context at all, not any
+  // particular redefinition. Since it's already there and (per the SIM
+  // provider) usable as-is, there's nothing to fix by resetting the modem
+  // or retrying - just log the query result and move on to registration
+  // without treating the (expected) redefinition failure as fatal.
+  WalterModemRsp queryRsp;
+  modem.sendCmd("AT+CGDCONT?", "OK", &queryRsp);
+
+  char cgdcontCmd[64];
+  snprintf(cgdcontCmd, sizeof(cgdcontCmd), "AT+CGDCONT=%d,\"IP\"", MODEM_PDP_CTX);
+
+  WalterModemRsp pdpRsp;
+  if (!modem.sendCmd(cgdcontCmd, "OK", &pdpRsp)) {
+    Serial.printf("Modem: AT+CGDCONT redefinition rejected (result=%d cmeError=%d) - "
+                  "expected if a context is already provisioned; continuing.\n",
+                  pdpRsp.result, pdpRsp.data.cmeError);
   }
 
   // One shared CA credential (Let's Encrypt root, reused from the MQTT
@@ -95,7 +137,7 @@ bool modemConnect() {
   Serial.println(F("Modem: waiting for network registration..."));
   unsigned long start = millis();
   while (!isRegistered(modem.getNetworkRegState()) && millis() - start < 60000) {
-    delay(500);
+    geophoneAwareDelay(500);
   }
 
   bool ok = isRegistered(modem.getNetworkRegState());
