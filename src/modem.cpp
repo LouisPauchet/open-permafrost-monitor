@@ -67,7 +67,24 @@ static void socketEventHandler(WMSocketEventType event, const WMSocketEventData 
 // is abandoned (asyncGeneration bumped) so a fresh one can be issued; a
 // stale callback firing later is recognized via the generation tag and
 // ignored, so it can never write into a buffer a newer request now owns.
-static uint8_t asyncChunk[1500];
+//
+// The async switch fixed the "lost command" hang, but live hardware then
+// hit a *separate*, more severe bug: a hard crash inside WalterModem's own
+// _cmdProcessingTask (_finishModemCMD dereferencing a stale command
+// pointer - same crash signature, same address, as the very first crash
+// fixed weeks ago), independent of blocking vs. async. The AT log showed
+// "No free buffers" errors interrupting the hex dump of a 1500-byte
+// SQNSRECV response *while it was still being received* - fresh
+// +SQNSRING notifications were arriving mid-transfer and corrupting the
+// parser's own buffer bookkeeping. That only ever happened after a full
+// 1500-byte read, never after the small ones, so a max-size request keeps
+// the UART busy long enough for a collision to become likely. Shrinking
+// the request size (with the aggressive-loop-while-full behavior in
+// drainSocketRing() still doing the catch-up work) narrows that window
+// without reintroducing the separate buffer-pool exhaustion an earlier,
+// paced version of this function caused - that was from an artificial
+// delay between requests, not from a smaller size.
+static uint8_t asyncChunk[256];
 static WalterModemRsp asyncRsp;
 static volatile bool asyncReceiveInFlight = false;
 static unsigned long asyncReceiveStartMs = 0;
