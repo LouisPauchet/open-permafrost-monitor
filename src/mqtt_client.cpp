@@ -1,10 +1,7 @@
 #include "mqtt_client.h"
 #include "device_config.h"
-#include "gnss.h"
 #include "isrg_root_x1.h"
 #include "modem.h"
-#include <ArduinoJson.h>
-#include <string.h>
 
 static bool connected = false;
 
@@ -23,44 +20,23 @@ bool mqttIsConnected() {
   return connected;
 }
 
-// Field names follow CF (Climate and Forecast) conventions for the
-// geospatial coordinates: latitude, longitude, altitude.
-void mqttPublishPosition(bool qualityOk) {
-  if (!connected || !gnssHasFix()) {
-    Serial.println(F("Skipping MQTT publish: no MQTT connection or no GNSS fix."));
-    return;
+// Position fields inside each row follow CF (Climate and Forecast)
+// convention naming (latitude/longitude/altitude) - see position_log.cpp
+// for how each row is built.
+bool mqttPublishBatch(const char *jsonArrayPayload, size_t rowCount) {
+  if (!connected) {
+    Serial.println(F("Skipping MQTT publish: not connected."));
+    return false;
   }
 
-  JsonDocument doc;
-
-  if (gnssHasDateTime()) {
-    char ts[25];
-    gnssTimestamp(ts, sizeof(ts));
-    doc["time"] = ts;
+  size_t len = strlen(jsonArrayPayload);
+  if (modemMqttPublish(deviceConfig.mqtt_topic, (const uint8_t *)jsonArrayPayload, len)) {
+    Serial.printf("Published %u position(s): %s\n", (unsigned)rowCount, jsonArrayPayload);
+    return true;
   }
 
-  doc["latitude"] = gnssLatitude();
-  doc["longitude"] = gnssLongitude();
-  doc["altitude"] = gnssAltitude();
-  doc["fix_quality"] = gnssFixQuality();
-  doc["satellites"] = gnssSatellites();
-
-  if (gnssHasAccuracyEstimate()) {
-    doc["horizontal_accuracy"] = gnssHorizontalAccuracy();
-    doc["vertical_accuracy"] = gnssVerticalAccuracy();
-  }
-
-  doc["quality_ok"] = qualityOk;
-
-  char payload[512];
-  size_t len = serializeJson(doc, payload);
-
-  if (modemMqttPublish(deviceConfig.mqtt_topic, (const uint8_t *)payload, len)) {
-    Serial.print(F("Published: "));
-    Serial.println(payload);
-  } else {
-    Serial.println(F("MQTT publish failed."));
-  }
+  Serial.println(F("MQTT publish failed."));
+  return false;
 }
 
 void mqttDisconnectBroker() {
