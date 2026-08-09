@@ -99,6 +99,14 @@ static void onSocketReceiveComplete(const WalterModemRsp *rsp, void *args) {
   asyncReceiveInFlight = false;
 
   if (rsp->result != WALTER_MODEM_STATE_OK) {
+    // A stray/unrelated error (e.g. "+CME ERROR: 4" during a burst) can
+    // fail this specific SQNSRECV attempt without the modem having
+    // actually discarded the data it was reporting via RING - retry
+    // rather than silently losing that chunk. Live hardware showed a
+    // 120s fix cycle forwarding only ~5.6KB of RTCM (far too little for
+    // continuous corrections) even after the crash fix, because failed
+    // reads during a burst were dropped instead of retried.
+    socketRingPending = true;
     return;
   }
 

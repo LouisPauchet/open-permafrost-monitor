@@ -25,7 +25,15 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // the plan) - loop() now runs forever, with each subsystem scheduled off
 // its own millis() timer instead of one wake/measure/sleep cycle per boot.
 
-static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
+// Deliberately not a round 10s: this caster's periodic station-metadata
+// burst (RTCM 1007/1008/1033, see modem.cpp) repeats roughly every 10s
+// too, counted from roughly the same connection-time epoch our own timer
+// starts from. A matching interval means every GGA resend lands in the
+// same collision window forever - live hardware confirmed 100% of GGA
+// sends failing for exactly this reason. An interval that doesn't evenly
+// divide the caster's cycle drifts in and out of phase with it instead,
+// so most attempts land outside the burst window.
+static const unsigned long GGA_RESEND_INTERVAL_MS = 7000;
 static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
 static const unsigned long MINISEED_FLUSH_INTERVAL_MS = 5000;
 // Not user-configurable (kept out of the config menu per the "as few
