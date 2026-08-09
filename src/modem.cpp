@@ -274,8 +274,29 @@ bool modemSocketOpen(const char *host, uint16_t port) {
   return true;
 }
 
+// Async for the same reason the receive path is: live hardware crashes
+// (_finishModemCMD, _cmdProcessingTask - see drainSocketRing() above)
+// consistently landed within a few hundred ms of the periodic GGA resend,
+// every time, across every log collected. ntripSendGGA() fires roughly
+// every 10s from the main loop - the same cadence a caster's periodic
+// station-metadata burst arrives on - so a *blocking* send here could
+// submit a new command to WalterModem's queue at the exact moment an
+// async receive is already in flight for that burst. Two commands
+// converging on the queue that close together, right as the library is
+// already under the most pressure, lines up with every crash seen so
+// far. Making the send async too - fire-and-forget, no result the caller
+// needs synchronously anyway - keeps app-side command submission from
+// ever blocking during exactly that window.
+static void onSocketSendComplete(const WalterModemRsp *rsp, void *args) {
+  if (rsp->result != WALTER_MODEM_STATE_OK) {
+    Serial.println(F("Modem: async GGA send failed (will retry next resend interval)."));
+  }
+}
+
 bool modemSocketSend(const uint8_t *data, size_t len) {
-  return modem.socketSend(MODEM_SOCKET_ID, (uint8_t *)data, (uint16_t)len);
+  static WalterModemRsp sendRsp; // must outlive the async call
+  return modem.socketSend(MODEM_SOCKET_ID, (uint8_t *)data, (uint16_t)len, WALTER_MODEM_RAI_NO_INFO,
+                           &sendRsp, onSocketSendComplete, nullptr);
 }
 
 size_t modemSocketAvailable() {
