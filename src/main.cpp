@@ -37,12 +37,20 @@ static const unsigned long TELEMETRY_BATCH_INTERVAL_MS = 3600000UL; // 1 hour
 // Safety net for unattended field operation: if loop() (or anything it
 // blocks in) doesn't feed this for WATCHDOG_TIMEOUT_S, the ESP32 reboots
 // itself rather than sitting stuck until someone physically power-cycles
-// it. Set above WalterModem's own internal AT command timeout (180s,
-// WALTER_MODEM_CMD_TIMEOUT_MS in the library) with margin, so a genuinely
-// wedged modem command - which live hardware has hit at least once, see
-// drainSocketRing() in modem.cpp - reboots the device instead of stalling
-// it indefinitely if the library's own timeout doesn't recover it.
-static const uint32_t WATCHDOG_TIMEOUT_S = 210;
+// it.
+//
+// Originally set to 210s - above WalterModem's own internal AT command
+// timeout (180s, WALTER_MODEM_CMD_TIMEOUT_MS) - on the assumption that a
+// wedged command would eventually resolve itself via that timeout, with
+// our watchdog only as a last-resort backstop. Live hardware disproved
+// that: a socket receive got stuck with zero "Command time-out" warnings
+// (which the library logs when its own 180s timeout fires) for the entire
+// 215s until our watchdog reset the device - i.e. the stuck command never
+// got attributed to _curCmd for the library's own timeout logic to see, so
+// nothing internal was ever going to recover it. There's no benefit to
+// waiting anywhere near 180s for a recovery path that doesn't apply to
+// this failure mode; shortened so a stall costs far less station uptime.
+static const uint32_t WATCHDOG_TIMEOUT_S = 60;
 
 static unsigned long lastFixCycleMs = 0;
 static unsigned long lastTelemetryMs = 0;
