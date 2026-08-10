@@ -7,9 +7,14 @@
 #include <math.h>
 
 // Mirror every raw byte from the F9P to the USB serial monitor - useful for
-// debugging (e.g. confirming GST/NMEA output timing around EXTINT wake).
-// Flip to false to go back to summary-only output.
-static const bool DEBUG_PRINT_RAW_GNSS = true;
+// debugging (e.g. confirming GST/NMEA output timing around EXTINT wake), but
+// costly: live hardware crashed (task watchdog firing, main task spending
+// too long blocked in Serial writes) once RTCM started flowing heavily at
+// the same time as this byte-by-byte NMEA mirror and WalterModem's own AT
+// debug tracing - all competing for the same USB-CDC link. Flip back to
+// true only for short, targeted debugging sessions, not left on during
+// real operation.
+static const bool DEBUG_PRINT_RAW_GNSS = false;
 
 // UART0, not UART2: the Arduino core's global `Serial2` object (used by
 // modem.cpp for the Sequans modem) is ALSO hardware UART peripheral 2

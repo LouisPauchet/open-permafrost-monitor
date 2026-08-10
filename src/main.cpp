@@ -270,10 +270,15 @@ void setup() {
 
   Serial.println(F("Walter <-> ZED-F9P + RS3D permafrost/seismic field station"));
 
-  // Belt-and-suspenders alongside the CORE_DEBUG_LEVEL build flag: makes
-  // WalterModem's AT command TX/RX trace (ESP_LOGD("WalterModem", ...))
-  // visible regardless of whatever default the Arduino core startup set.
-  esp_log_level_set("WalterModem", ESP_LOG_DEBUG);
+  // WalterModem's AT command TX/RX trace (ESP_LOGD("WalterModem", ...)) is
+  // useful for short debugging sessions but hex-dumps every RTCM chunk at
+  // DEBUG level - live hardware crashed (task watchdog on the idle task,
+  // starved by how long the main task spent blocked in Serial writes) once
+  // RTCM was flowing heavily enough for that plus the rest of this
+  // project's own logging to saturate the USB-CDC link. WARN keeps actual
+  // problems visible without the per-chunk firehose; raise back to
+  // ESP_LOG_DEBUG only for targeted debugging.
+  esp_log_level_set("WalterModem", ESP_LOG_WARN);
 
   loadDeviceConfig();
 
