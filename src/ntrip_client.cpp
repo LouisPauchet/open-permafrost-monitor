@@ -146,13 +146,23 @@ bool ntripIsConnected() {
 }
 
 void ntripPoll() {
-  uint8_t buf[256];
+  // Small chunks, re-checking the GNSS UART after each one (not "drain
+  // everything, then check GNSS") - GPS_BAUD is only 38400, so forwarding
+  // even a modest chunk to the F9P can take long enough that gnssWriteRTCM()
+  // blocks waiting for TX space. Without interleaving pollGNSS() this
+  // tightly, that whole stretch never drains what the F9P is sending back
+  // (NMEA, UBX ACKs, RXM-RTCM) - live hardware showed heavy, verified-real
+  // RTCM throughput (85KB+/cycle) with zero RXM-RTCM diagnostic lines ever
+  // seen, consistent with the F9P's replies being silently dropped by
+  // ESP32's own UART RX ring while starved of service.
+  uint8_t buf[64];
   size_t n;
   while ((n = modemSocketRead(buf, sizeof(buf))) > 0) {
     for (size_t i = 0; i < n; i++) {
       gnssWriteRTCM(buf[i]);
     }
     bytesForwarded += n;
+    pollGNSS();
   }
 }
 
