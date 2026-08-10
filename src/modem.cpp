@@ -405,8 +405,24 @@ size_t modemSocketRead(uint8_t *buf, size_t maxLen) {
   return n;
 }
 
+// Async for the same reason send/receive are (see the design notes above):
+// live hardware hit a task-watchdog abort landing right in this call, called
+// from ntripDisconnect() at the end of every fix cycle - right where the log
+// showed "abandoning a stuck async receive" firing twice in a row moments
+// earlier, i.e. the command channel was already under the exact contention
+// that's previously made a *blocking* AT command get lost with no internal
+// timeout ever firing. There's nothing the caller needs synchronously here -
+// socketRxLen/socketRingPending/asyncReceiveInFlight are reset immediately
+// below regardless of whether the close AT command itself ever completes.
+static void onSocketCloseComplete(const WalterModemRsp *rsp, void *args) {
+  if (rsp->result != WALTER_MODEM_STATE_OK) {
+    Serial.println(F("Modem: [diag] async socketClose failed."));
+  }
+}
+
 void modemSocketClose() {
-  modem.socketClose(MODEM_SOCKET_ID);
+  static WalterModemRsp closeRsp; // must outlive the async call
+  modem.socketClose(MODEM_SOCKET_ID, &closeRsp, onSocketCloseComplete, nullptr);
   xSemaphoreTake(socketRxMutex, portMAX_DELAY);
   socketRxLen = 0;
   xSemaphoreGive(socketRxMutex);
