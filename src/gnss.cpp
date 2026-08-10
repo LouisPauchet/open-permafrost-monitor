@@ -214,22 +214,25 @@ static void ubxParseByte(uint8_t c) {
       if (c == ubxCkB && ubxRxCkA == ubxCkA) {
         if (ubxClass == 0x02 && ubxMsgId == 0x32 && ubxLen >= 8) {
           // RXM-RTCM payload: version(1) flags(1) reserved/subType(2)
-          // refStation(2) msgType(2). flags bit0 = crcFailed.
+          // refStation(2) msgType(2). flags bit0 = crcFailed. Confirmed on
+          // live hardware that RTCM validates "ok" here once real
+          // corrections are flowing - only the failure case is still worth
+          // surfacing. Printing every message (routinely several per
+          // second under real RTCM load) was itself a Serial-blocking risk
+          // stacked on top of the others fixed alongside this - same class
+          // of task-watchdog exposure, just smaller.
           bool crcFailed = ubxPayload[1] & 0x01;
-          uint16_t refStation = (uint16_t)ubxPayload[4] | ((uint16_t)ubxPayload[5] << 8);
-          uint16_t msgType = (uint16_t)ubxPayload[6] | ((uint16_t)ubxPayload[7] << 8);
-          Serial.printf("[RTCM-IN] type=%u station=%u %s\n", msgType, refStation,
-                        crcFailed ? "CRC-FAIL" : "ok");
-        } else if (ubxClass == 0x05 && ubxLen >= 2) {
-          // UBX-ACK-ACK (id 0x01) / UBX-ACK-NAK (id 0x00) - the F9P sends one
-          // of these for every UBX-CFG-* message it receives, unconditionally,
-          // regardless of what that message actually configures. Temporary
-          // diagnostic: confirms whether our CFG-MSG/CFG-VALSET commands
-          // (GST enable, RXM-RTCM enable, RTCM3X-input enable) are actually
-          // being received/accepted at all, vs. UBX output simply being off
-          // for this port and every one of these frames going unseen.
-          Serial.printf("[UBX-%s] for class=0x%02X id=0x%02X\n", ubxMsgId == 0x01 ? "ACK" : "NAK",
-                        ubxPayload[0], ubxPayload[1]);
+          if (crcFailed) {
+            uint16_t refStation = (uint16_t)ubxPayload[4] | ((uint16_t)ubxPayload[5] << 8);
+            uint16_t msgType = (uint16_t)ubxPayload[6] | ((uint16_t)ubxPayload[7] << 8);
+            Serial.printf("[RTCM-IN] type=%u station=%u CRC-FAIL\n", msgType, refStation);
+          }
+        } else if (ubxClass == 0x05 && ubxMsgId == 0x00 && ubxLen >= 2) {
+          // UBX-ACK-NAK only (id 0x00) - the F9P sends one of ACK/NAK for
+          // every UBX-CFG-* message it receives, unconditionally. ACKs are
+          // the expected/routine case once the command channel is known to
+          // work; only a NAK (command rejected) is worth surfacing.
+          Serial.printf("[UBX-NAK] for class=0x%02X id=0x%02X\n", ubxPayload[0], ubxPayload[1]);
         }
       }
       ubxState = 0;
