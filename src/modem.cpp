@@ -333,9 +333,34 @@ static void onSocketSendComplete(const WalterModemRsp *rsp, void *args) {
   }
 }
 
+// WalterModem's socketSend() (WalterSocket.cpp) queues AT+SQNSSENDEXT and
+// stores the caller's raw pointer as cmd->payload - it does NOT copy it. The
+// actual UART write of that payload only happens later, asynchronously,
+// when the "> " data prompt line is parsed (WalterModem.cpp,
+// _uart->write(cmd->payload, cmd->payloadSize)), which can be a full
+// AT-command round-trip after this function returns. A caller passing a
+// stack-local buffer (ntripSendGGA()'s `line`) or a temporary String's
+// internal buffer (ntripConnectOnce()'s `request`) has every reason to
+// expect the bytes are consumed synchronously, but they're read back out
+// later - by which point that memory can already be reused by whatever else
+// ran in the gap. Confirmed on live hardware: the bytes actually
+// transmitted for a GGA send were garbage ("$G" followed by what looks like
+// unrelated float/double data), not the NMEA sentence built moments
+// earlier - which fully explains the caster accepting every connection but
+// never streaming RTCM, since this VRS mount needs a real GGA to start.
+// Copying into storage that outlives the async round-trip fixes it for
+// every caller at once, the same way sendRsp below already has to.
+static uint8_t sendBuf[512];
+
 bool modemSocketSend(const uint8_t *data, size_t len) {
+  if (len > sizeof(sendBuf)) {
+    Serial.println(F("Modem: modemSocketSend() payload exceeds sendBuf - dropped."));
+    return false;
+  }
+  memcpy(sendBuf, data, len);
+
   static WalterModemRsp sendRsp; // must outlive the async call
-  return modem.socketSend(MODEM_SOCKET_ID, (uint8_t *)data, (uint16_t)len, WALTER_MODEM_RAI_NO_INFO,
+  return modem.socketSend(MODEM_SOCKET_ID, sendBuf, (uint16_t)len, WALTER_MODEM_RAI_NO_INFO,
                            &sendRsp, onSocketSendComplete, nullptr);
 }
 

@@ -12,6 +12,18 @@ bool modemIsConnected();
 
 // Raw TCP socket (used by ntrip_client.cpp for the RTCM stream). Only one
 // socket is used at a time.
+//
+// Command mode (AT+SQNSSEND/AT+SQNSRECV), not the Sequans modem's
+// "online"/transparent socket mode - that was tried (AT+SQNSD connMode=0,
+// a direct UART<->socket pipe with no AT framing at all) specifically to
+// avoid this async command-queue machinery, but live hardware testing
+// showed the caster never receiving anything at all once dialed that way,
+// across multiple otherwise-correct variations (matching WalterModem's own
+// proven +SQNSD parameter list exactly, disabling hardware flow control,
+// waiting up to 20s for a reply) - this Sequans firmware revision doesn't
+// seem to support it reliably regardless of what the client does right.
+// Reverted to command mode, which is proven to work (sub-200ms caster
+// response, 85KB+/cycle of verified-real RTCM).
 bool modemSocketOpen(const char *host, uint16_t port);
 bool modemSocketSend(const uint8_t *data, size_t len);
 size_t modemSocketAvailable();
