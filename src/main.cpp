@@ -124,6 +124,7 @@ static void runGnssFixCycle() {
   unsigned long fixWaitStart = millis();
   unsigned long lastGstEnableRetry = 0;
   unsigned long lastRxmRtcmDiagResend = 0;
+  unsigned long lastStatusPrint = 0;
   bool qualityOk = false;
 
   while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL) {
@@ -179,6 +180,25 @@ static void runGnssFixCycle() {
     if (gnssHasFix() && gnssHasAccuracyEstimate() && gnssHorizontalAccuracy() <= deviceConfig.good_accuracy_m) {
       qualityOk = true;
       break;
+    }
+
+    // Temporary diagnostic: mid-cycle RTK progress, independent of whether
+    // the cycle ever reaches its own end-of-cycle summary print. Live
+    // hardware has been hitting a task-watchdog reset ~85-97s into heavy
+    // RTCM traffic (root cause not yet found - the async command paths
+    // that could plausibly explain a hang were traced and all fail
+    // gracefully, not blocking), cutting every cycle short before its
+    // normal "Fix quality: ..." line. The F9P is a separate chip that very
+    // likely keeps its own RTK engine state across an ESP32 reboot (only
+    // the correction stream itself is what actually stops, briefly, during
+    // the ~10-20s reboot/reinit) - this print is what lets convergence
+    // progress actually be observed despite the instability, rather than
+    // only ever seeing "cycle cut short, no data."
+    if (millis() - lastStatusPrint >= 10000) {
+      lastStatusPrint = millis();
+      Serial.printf("[STATUS] t=%lus fix=%s hAcc=%.3fm RTCM=%uB\n", (millis() - fixWaitStart) / 1000,
+                    gnssFixQualityLabel(gnssFixQuality()),
+                    gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f, ntripBytesForwarded());
     }
 
     delay(20);
