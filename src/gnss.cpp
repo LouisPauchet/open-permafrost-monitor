@@ -11,7 +11,25 @@
 // Flip to false to go back to summary-only output.
 static const bool DEBUG_PRINT_RAW_GNSS = true;
 
-static HardwareSerial GPSSerial(2);
+// UART0, not UART2: the Arduino core's global `Serial2` object (used by
+// modem.cpp for the Sequans modem) is ALSO hardware UART peripheral 2
+// (HardwareSerial Serial2(2), core/HardwareSerial.cpp) - two HardwareSerial
+// C++ instances both bound to uart_nr=2 share the same underlying IDF UART
+// driver, ring buffer, and GPIO matrix routing, not just the same "logical"
+// port. modemInit() (Serial2.begin(), pins 14/48) runs after initGNSS()
+// (this begin(), pins 16/17) in setup() - IDF's uart begin() detaches
+// whichever pins were previously attached and re-routes the peripheral to
+// the new ones, so from that point on this object would have been reading/
+// writing the modem's physical pins instead of the F9P's. That silently
+// explains a lot of this project's history: the F9P's own UBX replies
+// (RXM-RTCM, ACK/NAK) never being seen once the modem initializes, RTCM
+// meant for the F9P instead hitting the modem's RX line and corrupting its
+// AT command channel, and GNSS fix acquisition getting starved. UART0 is
+// genuinely free to use here - platformio.ini sets
+// ARDUINO_USB_CDC_ON_BOOT=1, so the console runs over native USB, not
+// physical UART0 (pins.h's own comment on FIELD_MODE_SELECT_PIN already
+// notes UART0/IO44/IO43 as "exposed but unused").
+static HardwareSerial GPSSerial(0);
 static TinyGPSPlus gps;
 
 // GST (GNSS Pseudorange error statistics) carries the receiver's own 1-sigma
