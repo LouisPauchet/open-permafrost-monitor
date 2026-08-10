@@ -355,6 +355,7 @@ void setup() {
   loadDeviceConfig();
 
   sdStorageInit();
+  sdWriterInit();
   initBattery();
   initPositionLog();
 
@@ -414,13 +415,12 @@ void loop() {
 
   unsigned long now = millis();
 
-  // Also covers the current burst's UBX/RTCM capture files
-  // (gnssFlushCaptureFiles()) - same underlying problem (an open file only
-  // reaches the card on close), same fix, no reason for a second timer.
+  // The UBX/RTCM capture streams flush themselves on their own timer, on
+  // the SD writer task (see sd_storage.cpp) - miniseedFlush() is the only
+  // one left needing a nudge from here.
   if (now - lastMiniseedFlushMs >= MINISEED_FLUSH_INTERVAL_MS) {
     lastMiniseedFlushMs = now;
     miniseedFlush();
-    gnssFlushCaptureFiles();
   }
 
   if (!firstFixCycleDone || now - lastFixCycleMs >= deviceConfig.measurement_interval_s * 1000UL) {

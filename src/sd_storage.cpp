@@ -1,6 +1,10 @@
 #include "sd_storage.h"
 #include "pins.h"
 #include <SD_MMC.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <string.h>
 
 static bool available = false;
 
@@ -129,4 +133,136 @@ File sdOpenForAppend(const char *path) {
     available = false;
   }
   return f;
+}
+
+// --- Async stream writer (see sd_storage.h for why) ---
+
+namespace {
+
+struct StreamRing {
+  uint8_t buf[4096]; // comfortably covers a worst-case ~2200-byte UBX RAWX
+                      // frame plus margin; RTCM only ever needs a fraction
+                      // of this between 50ms drains, sized the same for
+                      // simplicity, not because it needs to be this big.
+  size_t len = 0;
+  SemaphoreHandle_t mutex = nullptr;
+};
+
+struct StreamState {
+  File file;
+  char pendingPath[64] = "";
+  char pendingHeader[128] = ""; // empty = no header requested for this open
+  volatile bool openPending = false;
+  volatile bool closePending = false;
+};
+
+StreamRing g_ring[SD_STREAM_COUNT];
+StreamState g_stream[SD_STREAM_COUNT];
+TaskHandle_t g_writerTask = nullptr;
+
+// Runs on its own task - every blocking SD_MMC call (open/write/flush/
+// close) happens here and only here, so a wedged card blocks this task,
+// not whichever one called sdStreamWrite()/Open()/Close().
+void sdWriterTaskFn(void *) {
+  const TickType_t drainPeriod = pdMS_TO_TICKS(50);
+  unsigned long lastFlushMs = 0;
+  uint8_t local[sizeof(StreamRing::buf)]; // task-owned scratch, not on the stack per-iteration
+
+  for (;;) {
+    for (int s = 0; s < SD_STREAM_COUNT; s++) {
+      StreamState &st = g_stream[s];
+
+      if (st.openPending) {
+        st.openPending = false;
+        if (st.file) {
+          st.file.close();
+        }
+        st.file = sdOpenForAppend(st.pendingPath);
+        Serial.printf("SD writer: stream %d open %s -> %s\n", s, st.pendingPath,
+                      st.file ? "ok" : "FAILED");
+        if (st.file && st.pendingHeader[0] != '\0' && st.file.size() == 0) {
+          st.file.printf("%s\n", st.pendingHeader);
+        }
+      }
+
+      StreamRing &ring = g_ring[s];
+      xSemaphoreTake(ring.mutex, portMAX_DELAY);
+      size_t n = ring.len;
+      if (n > 0) {
+        memcpy(local, ring.buf, n);
+        ring.len = 0;
+      }
+      xSemaphoreGive(ring.mutex);
+
+      if (n > 0 && st.file) {
+        st.file.write(local, n);
+      }
+
+      if (st.closePending) {
+        st.closePending = false;
+        if (st.file) {
+          st.file.close();
+        }
+      }
+    }
+
+    // Periodic flush (not per-stream-close, which already flushes via
+    // close()) so a crash mid-burst loses at most this interval's worth of
+    // data rather than everything since the file was opened - same reason
+    // main.cpp already does this for MiniSEED, just relocated off the loop
+    // task along with everything else here.
+    if (millis() - lastFlushMs >= 5000) {
+      lastFlushMs = millis();
+      for (int s = 0; s < SD_STREAM_COUNT; s++) {
+        if (g_stream[s].file) {
+          g_stream[s].file.flush();
+        }
+      }
+    }
+
+    vTaskDelay(drainPeriod);
+  }
+}
+
+} // namespace
+
+void sdWriterInit() {
+  for (int s = 0; s < SD_STREAM_COUNT; s++) {
+    g_ring[s].mutex = xSemaphoreCreateMutex();
+  }
+  // Core 0, deliberately: loopTask and WalterModem's own queueProcessing/
+  // eventProcessing tasks are all already on core 1 (see modem.cpp) - no
+  // reason to add a fourth task competing there when core 0 is otherwise
+  // idle. Stack sized for the 4KB scratch buffer above plus SD_MMC/FatFs's
+  // own internal call depth with real margin.
+  xTaskCreatePinnedToCore(sdWriterTaskFn, "sdWriterTask", 10240, NULL, 1, &g_writerTask, 0);
+}
+
+void sdStreamOpen(SdStream stream, const char *path, const char *headerIfEmpty) {
+  StreamState &st = g_stream[stream];
+  strncpy(st.pendingPath, path, sizeof(st.pendingPath) - 1);
+  st.pendingPath[sizeof(st.pendingPath) - 1] = '\0';
+  if (headerIfEmpty) {
+    strncpy(st.pendingHeader, headerIfEmpty, sizeof(st.pendingHeader) - 1);
+    st.pendingHeader[sizeof(st.pendingHeader) - 1] = '\0';
+  } else {
+    st.pendingHeader[0] = '\0';
+  }
+  st.openPending = true;
+}
+
+void sdStreamWrite(SdStream stream, const uint8_t *data, size_t len) {
+  StreamRing &ring = g_ring[stream];
+  xSemaphoreTake(ring.mutex, portMAX_DELAY); // just a bounded memcpy - never blocks on SD I/O
+  size_t space = sizeof(ring.buf) - ring.len;
+  size_t n = len < space ? len : space; // drop the tail if the writer task can't keep up
+  if (n > 0) {
+    memcpy(ring.buf + ring.len, data, n);
+    ring.len += n;
+  }
+  xSemaphoreGive(ring.mutex);
+}
+
+void sdStreamClose(SdStream stream) {
+  g_stream[stream].closePending = true;
 }

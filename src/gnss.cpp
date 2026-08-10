@@ -150,11 +150,14 @@ static uint8_t lineLen = 0;
 // data first each burst (usually UBX, since RTCM only starts once NTRIP
 // has connected) - gnssHasDateTime() has almost always already gone true
 // by then (date typically arrives before a position fix), so the stamp is
-// a real timestamp in practice, not the boot-relative fallback.
-static File ubxFile;
-static File rtcmFile;
-static bool ubxFileAttemptedThisBurst = false;
-static bool rtcmFileAttemptedThisBurst = false;
+// a real timestamp in practice, not the boot-relative fallback. The actual
+// File I/O for both streams happens off this task entirely - see
+// sd_storage.h's SdStream API - so a wedged/degrading card (confirmed on
+// live hardware: a burst of "sdmmc_send_cmd returned 0x107" errors under
+// heavy burst traffic, then a call that never returned) can only ever
+// block the SD writer task, never this one.
+static bool ubxStreamOpenedThisBurst = false;
+static bool rtcmStreamOpenedThisBurst = false;
 static bool burstStampDecided = false;
 static char burstStamp[24] = "";
 static uint32_t gnssBurstCounter = 0;
@@ -181,34 +184,28 @@ static void gnssCaptureUbxFrame(const uint8_t *buf, size_t len) {
   if (!sdStorageAvailable()) {
     return;
   }
-  if (!ubxFile && !ubxFileAttemptedThisBurst) {
-    ubxFileAttemptedThisBurst = true; // decide/attempt exactly once per burst, even if this open fails
+  if (!ubxStreamOpenedThisBurst) {
+    ubxStreamOpenedThisBurst = true; // decide/attempt exactly once per burst, even if this open fails
     gnssEnsureBurstStamp();
     char path[64];
     snprintf(path, sizeof(path), "/data/gnss/%s.ubx", burstStamp);
-    ubxFile = sdOpenForAppend(path);
-    Serial.printf("GNSS: burst UBX capture -> %s (%s)\n", path, ubxFile ? "ok" : "open FAILED");
+    sdStreamOpen(SD_STREAM_UBX, path);
   }
-  if (ubxFile) {
-    ubxFile.write(buf, len);
-  }
+  sdStreamWrite(SD_STREAM_UBX, buf, len);
 }
 
-static void gnssCaptureRtcmByte(uint8_t b) {
+static void gnssCaptureRtcmBytes(const uint8_t *buf, size_t len) {
   if (!sdStorageAvailable()) {
     return;
   }
-  if (!rtcmFile && !rtcmFileAttemptedThisBurst) {
-    rtcmFileAttemptedThisBurst = true;
+  if (!rtcmStreamOpenedThisBurst) {
+    rtcmStreamOpenedThisBurst = true;
     gnssEnsureBurstStamp();
     char path[64];
     snprintf(path, sizeof(path), "/data/gnss/%s.rtcm", burstStamp);
-    rtcmFile = sdOpenForAppend(path);
-    Serial.printf("GNSS: burst RTCM (base) capture -> %s (%s)\n", path, rtcmFile ? "ok" : "open FAILED");
+    sdStreamOpen(SD_STREAM_RTCM, path);
   }
-  if (rtcmFile) {
-    rtcmFile.write(b);
-  }
+  sdStreamWrite(SD_STREAM_RTCM, buf, len);
 }
 
 // --- UBX binary frame parser ---
@@ -388,15 +385,11 @@ void gnssSleep() {
   GPSSerial.write(UBX_PMREQ_BACKUP_EXTINT_UARTRX, sizeof(UBX_PMREQ_BACKUP_EXTINT_UARTRX));
   GPSSerial.flush();
 
-  // End of this burst - close both capture files (attempted-but-failed-to-
-  // open leaves the File falsy, which close() already no-ops for safely)
-  // so the next burst starts fresh ones.
-  if (ubxFile) {
-    ubxFile.close();
-  }
-  if (rtcmFile) {
-    rtcmFile.close();
-  }
+  // End of this burst - close both capture streams (a stream never opened
+  // this burst, e.g. no RTCM if NTRIP never connected, just no-ops on the
+  // writer task) so the next burst starts fresh ones.
+  sdStreamClose(SD_STREAM_UBX);
+  sdStreamClose(SD_STREAM_RTCM);
 }
 
 void gnssWakeup() {
@@ -404,14 +397,10 @@ void gnssWakeup() {
   // UBX/RTCM byte decides a fresh stamp/file. Defensive close() in case a
   // previous burst somehow never got to gnssSleep() (e.g. skipped this
   // cycle).
-  if (ubxFile) {
-    ubxFile.close();
-  }
-  if (rtcmFile) {
-    rtcmFile.close();
-  }
-  ubxFileAttemptedThisBurst = false;
-  rtcmFileAttemptedThisBurst = false;
+  sdStreamClose(SD_STREAM_UBX);
+  sdStreamClose(SD_STREAM_RTCM);
+  ubxStreamOpenedThisBurst = false;
+  rtcmStreamOpenedThisBurst = false;
   burstStampDecided = false;
 
   // Wake trigger is an edge on EXTINT (u-blox docs/reference drivers note
@@ -447,18 +436,9 @@ void pollGNSS() {
   }
 }
 
-void gnssWriteRTCM(uint8_t b) {
-  gnssCaptureRtcmByte(b); // base-station side of the PPK pair - see the capture block above
-  GPSSerial.write(b);
-}
-
-void gnssFlushCaptureFiles() {
-  if (ubxFile) {
-    ubxFile.flush();
-  }
-  if (rtcmFile) {
-    rtcmFile.flush();
-  }
+void gnssWriteRTCM(const uint8_t *buf, size_t len) {
+  gnssCaptureRtcmBytes(buf, len); // base-station side of the PPK pair - see the capture block above
+  GPSSerial.write(buf, len);
 }
 
 bool gnssHasFix() {

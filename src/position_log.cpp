@@ -11,6 +11,10 @@ static char currentPath[48] = "";
 static size_t sentOffset = 0;   // committed high-water mark
 static size_t pendingOffset = 0; // file size as of the last positionLogReadUnsent() call
 
+static const char *CSV_HEADER = "time,latitude,longitude,altitude,horizontal_accuracy,"
+                                 "vertical_accuracy,fix_quality,quality_ok,battery_external_v,"
+                                 "battery_internal_v";
+
 static void rotateIfNeeded() {
   if (!gnssHasDateTime()) {
     return;
@@ -26,14 +30,12 @@ static void rotateIfNeeded() {
   sentOffset = 0;
   pendingOffset = 0;
 
-  if (sdStorageAvailable() && !SD_MMC.exists(currentPath)) {
-    File f = sdOpenForAppend(currentPath);
-    if (f) {
-      f.println("time,latitude,longitude,altitude,horizontal_accuracy,vertical_accuracy,"
-                 "fix_quality,quality_ok,battery_external_v,battery_internal_v");
-      f.close();
-    }
-  }
+  // Open (and, if the file turns out to be genuinely new, header) happens
+  // on the SD writer task - see sd_storage.h. No more SD_MMC.exists() check
+  // here: that was a blocking call in its own right, and headerIfEmpty
+  // already handles "already has a header from before a same-day reboot"
+  // by checking the file's size instead.
+  sdStreamOpen(SD_STREAM_POSITIONS, currentPath, CSV_HEADER);
 }
 
 void initPositionLog() {
@@ -49,23 +51,36 @@ void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInte
     return;
   }
 
-  File f = sdOpenForAppend(currentPath);
-  if (!f) {
-    return;
-  }
-
   char ts[25] = "";
   if (gnssHasDateTime()) {
     gnssTimestamp(ts, sizeof(ts));
   }
 
-  f.printf("%s,%.8f,%.8f,%.2f,%.3f,%.3f,%d,%s,%.2f,%.2f\n", ts, gnssLatitude(), gnssLongitude(),
-           gnssAltitude(), gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f,
-           gnssHasAccuracyEstimate() ? gnssVerticalAccuracy() : -1.0f, gnssFixQuality(),
-           qualityOk ? "true" : "false", batteryExternalV, batteryInternalV);
-  f.close();
+  char row[200];
+  int len = snprintf(row, sizeof(row), "%s,%.8f,%.8f,%.2f,%.3f,%.3f,%d,%s,%.2f,%.2f\n", ts,
+                      gnssLatitude(), gnssLongitude(), gnssAltitude(),
+                      gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f,
+                      gnssHasAccuracyEstimate() ? gnssVerticalAccuracy() : -1.0f, gnssFixQuality(),
+                      qualityOk ? "true" : "false", batteryExternalV, batteryInternalV);
+  if (len <= 0) {
+    return;
+  }
+  if ((size_t)len >= sizeof(row)) {
+    len = sizeof(row) - 1; // truncated - still write what fits rather than nothing
+  }
+  sdStreamWrite(SD_STREAM_POSITIONS, (const uint8_t *)row, (size_t)len);
 }
 
+// Two known, currently-accepted gaps left by this still being a direct
+// blocking read while positionLogAppend() writes via the SD writer task
+// (see sd_storage.h): (1) this read isn't itself protected against a
+// wedged card the way the write side now is - a hang here would still
+// reach the watchdog: fine while telemetry runs on its own well-spaced
+// timer, worth revisiting before calling this from somewhere more
+// frequent/latency-sensitive. (2) a row appended moments ago may not be
+// visible yet - it can still be sitting in the writer task's ring buffer
+// or its 50ms drain cycle hasn't run - but it's never lost, just picked up
+// on the next call via sentOffset, so this only affects freshness.
 size_t positionLogReadUnsent(char *buf, size_t bufSize) {
   if (!sdStorageAvailable() || currentPath[0] == '\0') {
     return 0;

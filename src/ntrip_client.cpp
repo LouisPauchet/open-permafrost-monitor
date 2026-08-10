@@ -158,9 +158,7 @@ void ntripPoll() {
   uint8_t buf[64];
   size_t n;
   while ((n = modemSocketRead(buf, sizeof(buf))) > 0) {
-    for (size_t i = 0; i < n; i++) {
-      gnssWriteRTCM(buf[i]);
-    }
+    gnssWriteRTCM(buf, n);
     bytesForwarded += n;
     pollGNSS();
   }

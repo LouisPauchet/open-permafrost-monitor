@@ -27,7 +27,6 @@ struct ChannelBuffer {
 };
 
 static ChannelBuffer channels[3];
-static File dailyFile;
 static char dailyDate[9] = "";
 
 static int dayOfYear(int year, int month, int day) {
@@ -68,12 +67,9 @@ static void rotateIfNeeded() {
   char today[9];
   gnssDateString(today, sizeof(today));
   if (strcmp(today, dailyDate) != 0) {
-    if (dailyFile) {
-      dailyFile.close();
-    }
     char path[48];
     sdBuildDailyPath(path, sizeof(path), "data/geophones/geophone", today, "mseed");
-    dailyFile = sdOpenForAppend(path);
+    sdStreamOpen(SD_STREAM_MINISEED, path); // actual open happens on the SD writer task, see sd_storage.h
     strncpy(dailyDate, today, sizeof(dailyDate) - 1);
   }
 }
@@ -81,7 +77,7 @@ static void rotateIfNeeded() {
 // Writes one fixed 512-byte MiniSEED data record (SEED v2.4 fixed header +
 // blockette 1000 + uncompressed 32-bit int samples, big-endian throughout).
 static void writeRecord(ChannelBuffer *ch) {
-  if (ch->count == 0 || !dailyFile) {
+  if (ch->count == 0) {
     return;
   }
 
@@ -142,7 +138,7 @@ static void writeRecord(ChannelBuffer *ch) {
     putU32BE(record + 56 + i * 4, (uint32_t)ch->samples[i]);
   }
 
-  dailyFile.write(record, RECORD_LEN);
+  sdStreamWrite(SD_STREAM_MINISEED, record, RECORD_LEN);
 
   ch->seq++;
   ch->count = 0;
@@ -164,7 +160,7 @@ void miniseedAddSample(const char *channel, int32_t sample) {
   rotateIfNeeded();
 
   ChannelBuffer *ch = findChannel(channel);
-  if (!ch || !dailyFile) {
+  if (!ch) {
     return;
   }
 
@@ -189,23 +185,17 @@ void miniseedAddSample(const char *channel, int32_t sample) {
   }
 }
 
+// Moves whatever's currently buffered in RAM (a partial, not-yet-114-sample
+// record) out into the stream, rather than waiting for a full record - so a
+// quiet channel's data still reaches the card within MINISEED_FLUSH_INTERVAL_MS
+// instead of waiting indefinitely for enough samples to accumulate. Actually
+// reaching the physical card is the SD writer task's own job now (periodic
+// flush, see sd_storage.cpp) - this function no longer needs to trigger
+// that itself.
 void miniseedFlush() {
   for (int i = 0; i < 3; i++) {
     if (channels[i].count > 0) {
       writeRecord(&channels[i]);
     }
-  }
-
-  // Despite the name, the loop above only moves samples out of the in-RAM
-  // channel buffer and into dailyFile via write() - it doesn't commit
-  // anything to the card. dailyFile stays open for the entire day (only
-  // closed on date rollover in rotateIfNeeded()), so without an explicit
-  // flush() here, every record written today sits in the FS layer's own
-  // write buffer until then - confirmed on live hardware, the file read
-  // back as 0 bytes after a reset despite write() having been called
-  // repeatedly. flush() commits without closing, so dailyFile can stay open
-  // across calls the way the rest of this file already assumes.
-  if (dailyFile) {
-    dailyFile.flush();
   }
 }

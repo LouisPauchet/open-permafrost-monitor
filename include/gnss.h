@@ -4,13 +4,12 @@
 void initGNSS();
 void pollGNSS(); // call frequently; feeds available UART bytes into the parser
 
-// Commits the current burst's /data/gnss/*.ubx and *.rtcm files' buffered
-// writes to the SD card without closing them - call periodically. Both
-// files are already opened/closed once per burst (see
-// gnssWakeup()/gnssSleep()), so this only matters for a crash/watchdog
-// reset mid-burst, not for getting the files to appear at all.
-void gnssFlushCaptureFiles();
-void gnssWriteRTCM(uint8_t b); // forward one RTCM correction byte from the NTRIP caster
+// Forwards a chunk of RTCM correction bytes from the NTRIP caster to the
+// F9P, and captures the same bytes as the base-station side of the PPK
+// pair (see gnss.cpp) - takes a chunk rather than one byte at a time so the
+// capture doesn't need its own byte-at-a-time buffering on top of the
+// SD_STREAM_RTCM ring buffer it already writes into (see sd_storage.h).
+void gnssWriteRTCM(const uint8_t *buf, size_t len);
 
 // Software sleep/wake via UBX-RXM-PMREQ backup mode + the EXTINT pin, so the
 // F9P (100+ mA active) doesn't dominate the power budget between measurement
