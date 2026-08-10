@@ -62,6 +62,24 @@ this same fault address as another instance of it - check whichever
 access that isn't preceded by a `cmd != NULL` / `cmd == NULL` check, and
 patch it the same way.
 
+## Tried and reverted: Sequans "online"/transparent socket mode
+
+`AT+SQNSD`'s `connMode=0` (the chip's own default, though every socket
+method in this library hardcodes `connMode=1`/command mode instead) turns
+the UART into a raw pipe straight to the socket after `CONNECT`, no more
+`AT+SQNSSEND`/`AT+SQNSRECV` framing. This looked like a clean way to avoid
+the whole class of command-mode crash/timing bugs documented above, and a
+small patch (`suspendUartCallback()`/`resumeUartCallback()`, to stop the
+library's RX handler from trying to parse raw RTCM bytes as AT responses)
+was added to support it. Live hardware testing showed the caster never
+receiving anything at all once dialed this way, across every variation
+tried (matching `socketDial()`'s own `+SQNSD` parameter list exactly,
+disabling hardware CTS/RTS flow control, waiting up to 20s for a reply) -
+this Sequans firmware revision doesn't seem to support online mode
+reliably regardless of what the client does right. Reverted to command
+mode, which is proven to work; the patch was removed along with it since
+nothing else needs it.
+
 ## Removing this
 
 If a future WalterModem release fixes this upstream, delete this directory,
