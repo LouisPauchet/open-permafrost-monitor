@@ -156,6 +156,12 @@ static void drainSocketRing() {
     if (millis() - asyncReceiveStartMs > ASYNC_RECEIVE_ABANDON_MS) {
       asyncReceiveInFlight = false;
       asyncGeneration++;
+      // Temporary diagnostic: previously silent. Live hardware has been
+      // hitting a task-watchdog reset ~7-90s into heavy RTCM traffic with
+      // no root cause pinned down yet - if abandons cluster right before a
+      // crash, that's evidence commands are getting lost at an increasing
+      // rate under sustained load, not a one-off.
+      Serial.println(F("Modem: [diag] abandoning a stuck async receive."));
     } else {
       return; // still within the normal grace period, keep waiting
     }
@@ -176,6 +182,8 @@ static void drainSocketRing() {
   if (!modem.socketReceive(MODEM_SOCKET_ID, asyncChunk, sizeof(asyncChunk), &asyncRsp,
                             onSocketReceiveComplete, (void *)(uintptr_t)myGeneration)) {
     asyncReceiveInFlight = false; // couldn't even queue the command - try again next call
+    // Temporary diagnostic: previously silent - see the abandon log above.
+    Serial.println(F("Modem: [diag] socketReceive() couldn't even queue (pool/queue full?)."));
   }
 }
 
