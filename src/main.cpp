@@ -2,6 +2,7 @@
 #include <esp_system.h>
 #include <esp_log.h>
 #include <esp_task_wdt.h>
+#include <SD_MMC.h> // for enumerating /data/gnss/*.ubx and *.rtcm in runDailyUploadIfNeeded()
 #include <string.h>
 
 #include "device_config.h"
@@ -100,8 +101,14 @@ static void runGnssFixCycle() {
 
   waitForInitialFix();
 
+  // PPK's raw-observation floor (see below) is anchored to this moment, not
+  // to gnssWakeup() - it's specifically "record for X more seconds once we
+  // have a fix", not "keep the module awake X seconds total".
+  bool hadInitialFix = gnssHasFix();
+  unsigned long initialFixMs = millis();
+
   bool ntripUp = false;
-  if (gnssHasFix()) {
+  if (hadInitialFix) {
     if (modemConnect()) {
       ntripUp = ntripConnect();
     }
@@ -118,8 +125,10 @@ static void runGnssFixCycle() {
     }
   }
 
-  Serial.printf("Waiting up to %u s more for a fix with horizontal accuracy <= %.3f m...\n",
-                deviceConfig.fix_timeout_s, deviceConfig.good_accuracy_m);
+  Serial.printf("Waiting up to %u s more for a fix with horizontal accuracy <= %.3f m"
+                " (recording at least %u s for PPK)...\n",
+                deviceConfig.fix_timeout_s, deviceConfig.good_accuracy_m,
+                (unsigned)deviceConfig.ppk_min_duration_s);
 
   unsigned long fixWaitStart = millis();
   unsigned long lastGstEnableRetry = 0;
@@ -127,7 +136,15 @@ static void runGnssFixCycle() {
   unsigned long lastStatusPrint = 0;
   bool qualityOk = false;
 
-  while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL) {
+  // Runs until BOTH: the RTK/NTRIP side is done (good accuracy reached, or
+  // fix_timeout_s gave up) AND the PPK raw-observation floor since the
+  // initial fix has been met - whichever of the two takes longer. A fast RTK
+  // convergence (seen as early as ~20s on live hardware) would otherwise
+  // stop recording well short of ppk_min_duration_s; a slow/failed
+  // convergence already usually exceeds it, but isn't guaranteed to
+  // (fix_timeout_s and ppk_min_duration_s are independently configurable).
+  while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL ||
+         (hadInitialFix && millis() - initialFixMs < deviceConfig.ppk_min_duration_s * 1000UL)) {
     esp_task_wdt_reset();
     pollGeophone();
     pollGNSS();
@@ -177,8 +194,15 @@ static void runGnssFixCycle() {
       gnssEnableRtcm3Input();
     }
 
-    if (gnssHasFix() && gnssHasAccuracyEstimate() && gnssHorizontalAccuracy() <= deviceConfig.good_accuracy_m) {
+    if (!qualityOk && gnssHasFix() && gnssHasAccuracyEstimate() &&
+        gnssHorizontalAccuracy() <= deviceConfig.good_accuracy_m) {
       qualityOk = true;
+    }
+
+    // Both sides of the loop condition satisfied - stop as soon as that's
+    // true rather than waiting out whichever bound happens to be longer a
+    // second time through the condition check above.
+    if (qualityOk && (!hadInitialFix || millis() - initialFixMs >= deviceConfig.ppk_min_duration_s * 1000UL)) {
       break;
     }
 
@@ -216,7 +240,6 @@ static void runGnssFixCycle() {
   Serial.printf("RTCM bytes forwarded: %u\n", ntripBytesForwarded());
 
   positionLogAppend(qualityOk, batteryExternalVoltage(), batteryInternalVoltage());
-
   ntripDisconnect();
   gnssSleep();
 }
@@ -239,6 +262,29 @@ static void runTelemetryBatch() {
     }
     mqttDisconnectBroker();
   }
+}
+
+// /data/gnss/ holds many per-burst files a day (see gnss.cpp), not one
+// daily file like the other data types, so it can't use the same
+// sdBuildDailyPath() single-file pattern - upload every *.ubx/*.rtcm whose
+// name starts with the rolled-over date instead. Filenames without a real
+// date prefix (the rare "boot_<millis>..." fallback, see
+// gnssEnsureBurstStamp()) won't match anything and are never uploaded by
+// this - a known, accepted gap for that already-rare case.
+static void uploadGnssBurstFiles(const char *datePrefix) {
+  File dir = SD_MMC.open("/data/gnss");
+  if (!dir) {
+    return;
+  }
+  size_t prefixLen = strlen(datePrefix);
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory() && strncmp(f.name(), datePrefix, prefixLen) == 0) {
+      uploadFile(f.path(), f.name());
+    }
+    f = dir.openNextFile();
+  }
+  dir.close();
 }
 
 static void runDailyUploadIfNeeded() {
@@ -267,15 +313,21 @@ static void runDailyUploadIfNeeded() {
     return; // don't advance lastUploadedDate - retry until it actually uploads
   }
 
-  static const char *prefixes[] = {"geophone", "gnss_raw", "ntrip", "positions"};
-  static const char *exts[] = {"mseed", "log", "log", "csv"};
-  for (int i = 0; i < 4; i++) {
-    char localPath[48];
-    sdBuildDailyPath(localPath, sizeof(localPath), prefixes[i], lastUploadedDate, exts[i]);
+  // Single daily file per type - local path carries the /data subfolder,
+  // remote name deliberately doesn't (the upload backend has no reason to
+  // care about this device's local folder layout).
+  static const char *localPrefixes[] = {"data/geophones/geophone", "data/positions"};
+  static const char *remoteBasenames[] = {"geophone", "positions"};
+  static const char *exts[] = {"mseed", "csv"};
+  for (int i = 0; i < 2; i++) {
+    char localPath[64];
+    sdBuildDailyPath(localPath, sizeof(localPath), localPrefixes[i], lastUploadedDate, exts[i]);
     char remoteName[64];
-    snprintf(remoteName, sizeof(remoteName), "%s_%s.%s", prefixes[i], lastUploadedDate, exts[i]);
+    snprintf(remoteName, sizeof(remoteName), "%s_%s.%s", remoteBasenames[i], lastUploadedDate, exts[i]);
     uploadFile(localPath, remoteName);
   }
+
+  uploadGnssBurstFiles(lastUploadedDate);
 
   strncpy(lastUploadedDate, today, sizeof(lastUploadedDate) - 1);
 }
@@ -356,11 +408,19 @@ void loop() {
   // service cable, no physical reset needed - see field_service.h.
   checkFieldModeTrigger();
 
+  // Lets a technician swap the SD card without a manual power cycle - see
+  // sd_storage.h.
+  sdCheckCardPresence();
+
   unsigned long now = millis();
 
+  // Also covers the current burst's UBX/RTCM capture files
+  // (gnssFlushCaptureFiles()) - same underlying problem (an open file only
+  // reaches the card on close), same fix, no reason for a second timer.
   if (now - lastMiniseedFlushMs >= MINISEED_FLUSH_INTERVAL_MS) {
     lastMiniseedFlushMs = now;
     miniseedFlush();
+    gnssFlushCaptureFiles();
   }
 
   if (!firstFixCycleDone || now - lastFixCycleMs >= deviceConfig.measurement_interval_s * 1000UL) {

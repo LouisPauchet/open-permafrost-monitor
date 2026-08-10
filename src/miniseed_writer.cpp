@@ -72,7 +72,7 @@ static void rotateIfNeeded() {
       dailyFile.close();
     }
     char path[48];
-    sdBuildDailyPath(path, sizeof(path), "geophone", today, "mseed");
+    sdBuildDailyPath(path, sizeof(path), "data/geophones/geophone", today, "mseed");
     dailyFile = sdOpenForAppend(path);
     strncpy(dailyDate, today, sizeof(dailyDate) - 1);
   }
@@ -194,5 +194,18 @@ void miniseedFlush() {
     if (channels[i].count > 0) {
       writeRecord(&channels[i]);
     }
+  }
+
+  // Despite the name, the loop above only moves samples out of the in-RAM
+  // channel buffer and into dailyFile via write() - it doesn't commit
+  // anything to the card. dailyFile stays open for the entire day (only
+  // closed on date rollover in rotateIfNeeded()), so without an explicit
+  // flush() here, every record written today sits in the FS layer's own
+  // write buffer until then - confirmed on live hardware, the file read
+  // back as 0 bytes after a reset despite write() having been called
+  // repeatedly. flush() commits without closing, so dailyFile can stay open
+  // across calls the way the rest of this file already assumes.
+  if (dailyFile) {
+    dailyFile.flush();
   }
 }

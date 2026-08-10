@@ -63,6 +63,7 @@ static void printMenu() {
   Serial.println(F("7) Set upload endpoint"));
   Serial.println(F("8) List SD card files"));
   Serial.println(F("9) Download a file"));
+  Serial.println(F("A) Set PPK minimum recording duration (s)"));
   Serial.println(F("0) Save and exit"));
   Serial.print(F("> "));
 }
@@ -72,6 +73,7 @@ static void showConfig() {
   Serial.printf("Measurement interval: %u s\n", (unsigned)deviceConfig.measurement_interval_s);
   Serial.printf("Fix timeout: %u s\n", (unsigned)deviceConfig.fix_timeout_s);
   Serial.printf("Good accuracy: %.3f m\n", deviceConfig.good_accuracy_m);
+  Serial.printf("PPK minimum recording duration: %u s\n", (unsigned)deviceConfig.ppk_min_duration_s);
   Serial.printf("MQTT: %s:%u (client %s)\n", deviceConfig.mqtt_host, deviceConfig.mqtt_port,
                 deviceConfig.mqtt_client_id);
   Serial.printf("NTRIP: %s:%u/%s\n", deviceConfig.ntrip_host, deviceConfig.ntrip_port,
@@ -108,18 +110,32 @@ static void setUpload() {
   promptString("Upload API key", deviceConfig.upload_api_key, sizeof(deviceConfig.upload_api_key));
 }
 
-static void listFiles() {
-  File root = SD_MMC.open("/");
-  if (!root) {
-    Serial.println(F("SD card not available."));
-    return;
+// Recurses one level deep, which is all the current /data/<subfolder>/file
+// layout (see sd_storage.cpp/gnss.cpp) needs - a flat listing of just "/"
+// would show nothing but an empty "data" entry now that every real file
+// lives under it.
+static bool listFilesIn(const char *dirPath) {
+  File dir = SD_MMC.open(dirPath);
+  if (!dir) {
+    return false;
   }
-  File f = root.openNextFile();
+  File f = dir.openNextFile();
   while (f) {
-    Serial.printf("%-32s %10lu bytes\n", f.name(), (unsigned long)f.size());
-    f = root.openNextFile();
+    if (f.isDirectory()) {
+      listFilesIn(f.path());
+    } else {
+      Serial.printf("%-40s %10lu bytes\n", f.path(), (unsigned long)f.size());
+    }
+    f = dir.openNextFile();
   }
-  root.close();
+  dir.close();
+  return true;
+}
+
+static void listFiles() {
+  if (!listFilesIn("/")) {
+    Serial.println(F("SD card not available."));
+  }
 }
 
 static void downloadFile() {
@@ -172,6 +188,8 @@ void runFieldService() {
       listFiles();
     } else if (choice == "9") {
       downloadFile();
+    } else if (choice == "A" || choice == "a") {
+      promptUInt("PPK minimum recording duration (s)", &deviceConfig.ppk_min_duration_s);
     } else if (choice == "0") {
       saveDeviceConfig();
       Serial.println(F("Configuration saved."));

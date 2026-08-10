@@ -22,7 +22,7 @@ static void rotateIfNeeded() {
   }
 
   strncpy(currentDate, today, sizeof(currentDate) - 1);
-  sdBuildDailyPath(currentPath, sizeof(currentPath), "positions", today, "csv");
+  sdBuildDailyPath(currentPath, sizeof(currentPath), "data/positions", today, "csv");
   sentOffset = 0;
   pendingOffset = 0;
 

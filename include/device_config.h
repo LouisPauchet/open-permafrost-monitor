@@ -21,6 +21,13 @@ struct DeviceConfig {
   uint32_t measurement_interval_s;  // how often to take a GNSS fix, publish, sleep
   uint32_t fix_timeout_s;           // max time to wait for a "good" fix before giving up
   float good_accuracy_m;            // horizontal accuracy threshold for a "good" fix
+  // Minimum raw-observation (RAWX/SFRBX) recording time for PPK post-
+  // processing, measured from the initial (autonomous) fix - independent of
+  // fix_timeout_s/good_accuracy_m, which govern the real-time RTK/NTRIP
+  // side. A fast RTK convergence would otherwise end the cycle (and put the
+  // GNSS module to sleep) well before enough raw data has accumulated to
+  // post-process.
+  uint32_t ppk_min_duration_s;
 
   // Daily-file upload endpoint. One plain HTTPS POST per file (large files
   // chunked, see upload_client.h), authenticated with HTTP Basic auth using

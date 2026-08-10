@@ -132,33 +132,92 @@ static bool haveGGA = false;
 static char lineBuf[100];
 static uint8_t lineLen = 0;
 
-// Daily-rotated raw NMEA+UBX capture (for PPK/PPP post-processing), only
-// meaningful once GNSS time is known (used for the filename date).
-static File rawLogFile;
-static char rawLogDate[9] = "";
+// Two capture files per GNSS burst (wake-to-sleep cycle, see
+// gnssWakeup()/gnssSleep()) under /data/gnss/, sharing one filename stamp
+// so they're trivially paired for PPK post-processing:
+//   <stamp>.ubx  - rover side: every fully-verified UBX frame (any type,
+//                  not just RAWX/SFRBX). NMEA is deliberately not captured
+//                  (PPK/PPP tooling only needs the UBX stream).
+//   <stamp>.rtcm - base station side: the raw RTCM3 byte stream as
+//                  received from the NTRIP caster, before forwarding to the
+//                  F9P (see gnssWriteRTCM()). For a network-RTK/VRS mount
+//                  this is synthesized nearest the rover rather than a
+//                  single physical base, but it's still the correct/only
+//                  available base-side observation data for this setup,
+//                  and is what PPK tooling expects regardless of how the
+//                  caster produced it.
+// The stamp is decided lazily, by whichever of the two streams produces
+// data first each burst (usually UBX, since RTCM only starts once NTRIP
+// has connected) - gnssHasDateTime() has almost always already gone true
+// by then (date typically arrives before a position fix), so the stamp is
+// a real timestamp in practice, not the boot-relative fallback.
+static File ubxFile;
+static File rtcmFile;
+static bool ubxFileAttemptedThisBurst = false;
+static bool rtcmFileAttemptedThisBurst = false;
+static bool burstStampDecided = false;
+static char burstStamp[24] = "";
+static uint32_t gnssBurstCounter = 0;
 
-static void rawLogRotateIfNeeded() {
-  if (!sdStorageAvailable() || !gnssHasDateTime()) {
+static void gnssEnsureBurstStamp() {
+  if (burstStampDecided) {
     return;
   }
-  char today[9];
-  gnssDateString(today, sizeof(today));
-  if (strcmp(today, rawLogDate) != 0) {
-    if (rawLogFile) {
-      rawLogFile.close();
-    }
-    char path[48];
-    sdBuildDailyPath(path, sizeof(path), "gnss_raw", today, "log");
-    rawLogFile = sdOpenForAppend(path);
-    strncpy(rawLogDate, today, sizeof(rawLogDate) - 1);
+  burstStampDecided = true;
+  gnssBurstCounter++;
+  if (gnssHasDateTime()) {
+    snprintf(burstStamp, sizeof(burstStamp), "%04d%02d%02d_%02d%02d%02d_%03lu", gnssYear(), gnssMonth(),
+             gnssDay(), gnssHour(), gnssMinute(), gnssSecond(), (unsigned long)(gnssBurstCounter % 1000));
+  } else {
+    // Rare fallback (a frame arrived before GNSS ever knew the date this
+    // boot) - not collision-safe across reboots the way a real timestamp
+    // is, but gnssBurstCounter at least keeps it unique within this boot.
+    snprintf(burstStamp, sizeof(burstStamp), "boot_%lu_%03lu", millis(),
+             (unsigned long)(gnssBurstCounter % 1000));
   }
 }
 
-// --- Minimal UBX binary frame parser (RXM-RTCM diagnostic only) ---
+static void gnssCaptureUbxFrame(const uint8_t *buf, size_t len) {
+  if (!sdStorageAvailable()) {
+    return;
+  }
+  if (!ubxFile && !ubxFileAttemptedThisBurst) {
+    ubxFileAttemptedThisBurst = true; // decide/attempt exactly once per burst, even if this open fails
+    gnssEnsureBurstStamp();
+    char path[64];
+    snprintf(path, sizeof(path), "/data/gnss/%s.ubx", burstStamp);
+    ubxFile = sdOpenForAppend(path);
+    Serial.printf("GNSS: burst UBX capture -> %s (%s)\n", path, ubxFile ? "ok" : "open FAILED");
+  }
+  if (ubxFile) {
+    ubxFile.write(buf, len);
+  }
+}
+
+static void gnssCaptureRtcmByte(uint8_t b) {
+  if (!sdStorageAvailable()) {
+    return;
+  }
+  if (!rtcmFile && !rtcmFileAttemptedThisBurst) {
+    rtcmFileAttemptedThisBurst = true;
+    gnssEnsureBurstStamp();
+    char path[64];
+    snprintf(path, sizeof(path), "/data/gnss/%s.rtcm", burstStamp);
+    rtcmFile = sdOpenForAppend(path);
+    Serial.printf("GNSS: burst RTCM (base) capture -> %s (%s)\n", path, rtcmFile ? "ok" : "open FAILED");
+  }
+  if (rtcmFile) {
+    rtcmFile.write(b);
+  }
+}
+
+// --- UBX binary frame parser ---
 // The F9P's UART interleaves NMEA (line-based, handled below) with UBX
-// binary frames (0xB5 0x62 sync, class/id/length header, payload,
-// 2-byte checksum). This only looks for RXM-RTCM; everything else is
-// skipped once its checksum is (or isn't) verified.
+// binary frames (0xB5 0x62 sync, class/id/length header, payload, 2-byte
+// checksum). Every fully-verified frame - any type, not just RAWX/SFRBX -
+// gets captured to the current burst's .ubx file below; ubxPayload is a
+// separate, small, fixed snapshot of just the first bytes, kept only for
+// the RXM-RTCM/ACK-NAK diagnostics that already existed here.
 static uint8_t ubxState = 0;
 static uint8_t ubxClass = 0, ubxMsgId = 0;
 static uint16_t ubxLen = 0, ubxIdx = 0;
@@ -166,27 +225,62 @@ static uint8_t ubxPayload[16];
 static uint8_t ubxCkA = 0, ubxCkB = 0;
 static uint8_t ubxRxCkA = 0;
 
+// Capacity generously covers the largest realistic frame - RXM-RAWX is
+// 16 + 32*numMeas payload bytes, and a ZED-F9P tracking many signals across
+// several constellations could approach ~2000. A frame that's somehow
+// still bigger than this is dropped whole (not captured truncated/corrupt)
+// rather than overflowing the buffer.
+static const size_t UBX_CAPTURE_BUF_SIZE = 2200;
+static uint8_t ubxCaptureBuf[UBX_CAPTURE_BUF_SIZE];
+static size_t ubxCaptureLen = 0;
+static bool ubxCaptureOverflowed = false;
+
+static void ubxCaptureByte(uint8_t c) {
+  if (ubxCaptureLen < UBX_CAPTURE_BUF_SIZE) {
+    ubxCaptureBuf[ubxCaptureLen++] = c;
+  } else {
+    ubxCaptureOverflowed = true;
+  }
+}
+
 static void ubxParseByte(uint8_t c) {
   switch (ubxState) {
-    case 0: ubxState = (c == 0xB5) ? 1 : 0; break;
-    case 1: ubxState = (c == 0x62) ? 2 : 0; break;
+    case 0:
+      if (c == 0xB5) {
+        ubxState = 1;
+        ubxCaptureLen = 0;
+        ubxCaptureOverflowed = false;
+        ubxCaptureByte(c);
+      }
+      break;
+    case 1:
+      if (c == 0x62) {
+        ubxState = 2;
+        ubxCaptureByte(c);
+      } else {
+        ubxState = 0;
+      }
+      break;
     case 2:
       ubxClass = c;
       ubxCkA = c;
       ubxCkB = c;
       ubxState = 3;
+      ubxCaptureByte(c);
       break;
     case 3:
       ubxMsgId = c;
       ubxCkA += c;
       ubxCkB += ubxCkA;
       ubxState = 4;
+      ubxCaptureByte(c);
       break;
     case 4:
       ubxLen = c;
       ubxCkA += c;
       ubxCkB += ubxCkA;
       ubxState = 5;
+      ubxCaptureByte(c);
       break;
     case 5:
       ubxLen |= ((uint16_t)c << 8);
@@ -194,6 +288,7 @@ static void ubxParseByte(uint8_t c) {
       ubxCkB += ubxCkA;
       ubxIdx = 0;
       ubxState = (ubxLen == 0) ? 7 : 6;
+      ubxCaptureByte(c);
       break;
     case 6:
       if (ubxIdx < sizeof(ubxPayload)) {
@@ -202,6 +297,7 @@ static void ubxParseByte(uint8_t c) {
       ubxIdx++;
       ubxCkA += c;
       ubxCkB += ubxCkA;
+      ubxCaptureByte(c);
       if (ubxIdx >= ubxLen) {
         ubxState = 7;
       }
@@ -209,9 +305,15 @@ static void ubxParseByte(uint8_t c) {
     case 7:
       ubxRxCkA = c;
       ubxState = 8;
+      ubxCaptureByte(c);
       break;
-    case 8:
-      if (c == ubxCkB && ubxRxCkA == ubxCkA) {
+    case 8: {
+      ubxCaptureByte(c);
+      bool ok = (c == ubxCkB && ubxRxCkA == ubxCkA);
+      if (ok && !ubxCaptureOverflowed) {
+        gnssCaptureUbxFrame(ubxCaptureBuf, ubxCaptureLen);
+      }
+      if (ok) {
         if (ubxClass == 0x02 && ubxMsgId == 0x32 && ubxLen >= 8) {
           // RXM-RTCM payload: version(1) flags(1) reserved/subType(2)
           // refStation(2) msgType(2). flags bit0 = crcFailed. Confirmed on
@@ -237,6 +339,7 @@ static void ubxParseByte(uint8_t c) {
       }
       ubxState = 0;
       break;
+    }
   }
 }
 
@@ -284,9 +387,33 @@ void initGNSS() {
 void gnssSleep() {
   GPSSerial.write(UBX_PMREQ_BACKUP_EXTINT_UARTRX, sizeof(UBX_PMREQ_BACKUP_EXTINT_UARTRX));
   GPSSerial.flush();
+
+  // End of this burst - close both capture files (attempted-but-failed-to-
+  // open leaves the File falsy, which close() already no-ops for safely)
+  // so the next burst starts fresh ones.
+  if (ubxFile) {
+    ubxFile.close();
+  }
+  if (rtcmFile) {
+    rtcmFile.close();
+  }
 }
 
 void gnssWakeup() {
+  // Start of a new burst - reset capture state so the next captured
+  // UBX/RTCM byte decides a fresh stamp/file. Defensive close() in case a
+  // previous burst somehow never got to gnssSleep() (e.g. skipped this
+  // cycle).
+  if (ubxFile) {
+    ubxFile.close();
+  }
+  if (rtcmFile) {
+    rtcmFile.close();
+  }
+  ubxFileAttemptedThisBurst = false;
+  rtcmFileAttemptedThisBurst = false;
+  burstStampDecided = false;
+
   // Wake trigger is an edge on EXTINT (u-blox docs/reference drivers note
   // it can be a falling or rising edge) - drive both to not depend on which.
   pinMode(GPS_EXTINT_PIN, OUTPUT);
@@ -298,18 +425,13 @@ void gnssWakeup() {
 }
 
 void pollGNSS() {
-  rawLogRotateIfNeeded();
-
   while (GPSSerial.available() > 0) {
     char c = GPSSerial.read();
     if (DEBUG_PRINT_RAW_GNSS) {
       Serial.write(c);
     }
-    if (rawLogFile) {
-      rawLogFile.write((uint8_t)c);
-    }
     gps.encode(c);
-    ubxParseByte((uint8_t)c);
+    ubxParseByte((uint8_t)c); // captures completed UBX frames to the current burst's .ubx file itself
 
     if (c == '\n') {
       lineBuf[lineLen] = '\0';
@@ -326,7 +448,17 @@ void pollGNSS() {
 }
 
 void gnssWriteRTCM(uint8_t b) {
+  gnssCaptureRtcmByte(b); // base-station side of the PPK pair - see the capture block above
   GPSSerial.write(b);
+}
+
+void gnssFlushCaptureFiles() {
+  if (ubxFile) {
+    ubxFile.flush();
+  }
+  if (rtcmFile) {
+    rtcmFile.flush();
+  }
 }
 
 bool gnssHasFix() {

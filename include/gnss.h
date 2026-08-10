@@ -3,6 +3,13 @@
 
 void initGNSS();
 void pollGNSS(); // call frequently; feeds available UART bytes into the parser
+
+// Commits the current burst's /data/gnss/*.ubx and *.rtcm files' buffered
+// writes to the SD card without closing them - call periodically. Both
+// files are already opened/closed once per burst (see
+// gnssWakeup()/gnssSleep()), so this only matters for a crash/watchdog
+// reset mid-burst, not for getting the files to appear at all.
+void gnssFlushCaptureFiles();
 void gnssWriteRTCM(uint8_t b); // forward one RTCM correction byte from the NTRIP caster
 
 // Software sleep/wake via UBX-RXM-PMREQ backup mode + the EXTINT pin, so the

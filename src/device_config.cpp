@@ -28,6 +28,7 @@ static void applyDefaults() {
   deviceConfig.measurement_interval_s = 600; // 10 minutes
   deviceConfig.fix_timeout_s = 120;          // give up after 2 minutes if not "good"
   deviceConfig.good_accuracy_m = 0.05f;      // 5 cm
+  deviceConfig.ppk_min_duration_s = 120;     // 2 minutes of raw observations per cycle
 
   copyField(deviceConfig.upload_host, sizeof(deviceConfig.upload_host), UPLOAD_HOST);
   deviceConfig.upload_port = UPLOAD_PORT;
@@ -59,6 +60,7 @@ void loadDeviceConfig() {
     loaded.measurement_interval_s = prefs.getUInt("interval_s", loaded.measurement_interval_s);
     loaded.fix_timeout_s = prefs.getUInt("timeout_s", loaded.fix_timeout_s);
     loaded.good_accuracy_m = prefs.getFloat("accuracy_m", loaded.good_accuracy_m);
+    loaded.ppk_min_duration_s = prefs.getUInt("ppk_s", loaded.ppk_min_duration_s);
 
     prefs.getString("upload_host", loaded.upload_host, sizeof(loaded.upload_host));
     loaded.upload_port = prefs.getUShort("upload_port", loaded.upload_port);
@@ -102,6 +104,7 @@ void saveDeviceConfig() {
   prefs.putUInt("interval_s", deviceConfig.measurement_interval_s);
   prefs.putUInt("timeout_s", deviceConfig.fix_timeout_s);
   prefs.putFloat("accuracy_m", deviceConfig.good_accuracy_m);
+  prefs.putUInt("ppk_s", deviceConfig.ppk_min_duration_s);
 
   prefs.putString("upload_host", deviceConfig.upload_host);
   prefs.putUShort("upload_port", deviceConfig.upload_port);
