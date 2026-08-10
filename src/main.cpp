@@ -25,15 +25,11 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // the plan) - loop() now runs forever, with each subsystem scheduled off
 // its own millis() timer instead of one wake/measure/sleep cycle per boot.
 
-// Deliberately not a round 10s: this caster's periodic station-metadata
-// burst (RTCM 1007/1008/1033, see modem.cpp) repeats roughly every 10s
-// too, counted from roughly the same connection-time epoch our own timer
-// starts from. A matching interval means every GGA resend lands in the
-// same collision window forever - live hardware confirmed 100% of GGA
-// sends failing for exactly this reason. An interval that doesn't evenly
-// divide the caster's cycle drifts in and out of phase with it instead,
-// so most attempts land outside the burst window.
-static const unsigned long GGA_RESEND_INTERVAL_MS = 7000;
+// CPOS documents a GGA resend interval of 10s - this is a network-RTK/VRS
+// mount (confirmed with the user), which genuinely needs GGA to know where
+// to center corrections, unlike a single physical base station that would
+// send the same stream regardless.
+static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 // This NTRIP mount is network RTK/VRS (confirmed with the user) - it
 // genuinely needs GGA to know where to center corrections, unlike a
 // single physical base station that would send the same stream
@@ -73,21 +69,59 @@ static unsigned long lastMiniseedFlushMs = 0;
 static char lastUploadedDate[9] = "";
 static bool firstFixCycleDone = false;
 
+// CPOS (the network RTK service behind this NTRIP mount) documents that a
+// client must already have a regular fix - autonomous is fine - before
+// opening an NTRIP session: the correction stream is centered on whatever
+// position the first GGA carries, so connecting earlier just spends the
+// window sending a quality=0/empty GGA the caster has nothing to center
+// corrections on. The modem has nothing else to do during this wait, so
+// deferring the connect costs nothing.
+static void waitForInitialFix() {
+  Serial.printf("Waiting up to %u s for an initial fix before starting NTRIP...\n",
+                deviceConfig.fix_timeout_s);
+  unsigned long start = millis();
+  unsigned long lastGstEnableRetry = 0;
+  while (!gnssHasFix() && millis() - start < deviceConfig.fix_timeout_s * 1000UL) {
+    esp_task_wdt_reset();
+    pollGeophone();
+    pollGNSS();
+    if (millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
+      lastGstEnableRetry = millis();
+      gnssEnableGST();
+    }
+    delay(20);
+  }
+}
+
 static void runGnssFixCycle() {
   gnssWakeup();
   geophoneAwareDelay(500);
   initGNSS();
 
+  waitForInitialFix();
+
   bool ntripUp = false;
-  if (modemConnect()) {
-    ntripUp = ntripConnect();
+  if (gnssHasFix()) {
+    if (modemConnect()) {
+      ntripUp = ntripConnect();
+    }
+  } else {
+    Serial.println(F("No initial fix within timeout - skipping NTRIP this cycle."));
   }
 
-  Serial.printf("Waiting up to %u s for a fix with horizontal accuracy <= %.3f m...\n",
+  // Per CPOS: first GGA immediately on connect, then every
+  // GGA_RESEND_INTERVAL_MS - not delayed by a full interval like a resend.
+  unsigned long nextGgaAttemptMs = 0;
+  if (ntripUp) {
+    if (ntripSendGGA(gnssLastGGA())) {
+      nextGgaAttemptMs = millis() + GGA_RESEND_INTERVAL_MS;
+    }
+  }
+
+  Serial.printf("Waiting up to %u s more for a fix with horizontal accuracy <= %.3f m...\n",
                 deviceConfig.fix_timeout_s, deviceConfig.good_accuracy_m);
 
   unsigned long fixWaitStart = millis();
-  unsigned long nextGgaAttemptMs = 0;
   unsigned long lastGstEnableRetry = 0;
   unsigned long lastRxmRtcmDiagResend = 0;
   bool qualityOk = false;
