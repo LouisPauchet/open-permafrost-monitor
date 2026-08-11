@@ -14,7 +14,7 @@ static size_t pendingOffset = 0; // file size as of the last positionLogReadUnse
 
 static const char *CSV_HEADER = "time,latitude,longitude,altitude,horizontal_accuracy,"
                                  "vertical_accuracy,fix_quality,quality_ok,battery_external_v,"
-                                 "battery_internal_v,ref_locked,north_m,east_m,up_m,epoch_ms";
+                                 "battery_internal_v,has_displacement,north_m,east_m,up_m,epoch_ms";
 
 static void rotateIfNeeded() {
   if (!gnssHasDateTime()) {
@@ -163,8 +163,16 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
     values["quality_ok"] = (strcmp(field[7], "true") == 0);
     values["battery_external_v"] = atof(field[8]);
     values["battery_internal_v"] = atof(field[9]);
-    bool refLocked = (strcmp(field[10], "true") == 0);
-    values["ref_locked"] = refLocked;
+    // Per-row: was a valid displacement actually computed for this reading
+    // (gated on quality_ok, see positionLogAppend()) - NOT whether the
+    // station's reference position is locked, which is a one-time,
+    // effectively permanent state after commissioning completes. The old
+    // field name "ref_locked" read as the latter and could easily be
+    // misread on a dashboard as the station repeatedly losing its
+    // reference lock, when a false value here just means this particular
+    // reading's quality wasn't good enough to trust for displacement.
+    bool hasDisplacement = (strcmp(field[10], "true") == 0);
+    values["has_displacement"] = hasDisplacement;
     float northM = atof(field[11]);
     float eastM = atof(field[12]);
     values["north_m"] = northM;
@@ -173,7 +181,8 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
     // Derived, not stored separately on disk - dashboards generally want a
     // single at-a-glance "how far has it moved" figure alongside the
     // directional components.
-    values["horizontal_displacement_m"] = refLocked ? sqrtf(northM * northM + eastM * eastM) : 0.0f;
+    values["horizontal_displacement_m"] =
+        hasDisplacement ? sqrtf(northM * northM + eastM * eastM) : 0.0f;
 
     // Stop before this row would overflow the caller's buffer - publish the
     // valid, complete batch built so far now rather than a truncated one;

@@ -66,6 +66,7 @@ static unsigned long lastBatteryCheckMs = 0;
 static char lastUploadedDate[9] = "";
 static bool firstFixCycleDone = false;
 static bool batteryOkForBurst = true;
+static bool modemSleepPending = false; // see runGnssFixCycle()'s end and loop() below
 
 // Read no more than once every 30s - analogReadMilliVolts() is cheap, but
 // there's no reason to poll it every loop() iteration when the whole point
@@ -305,6 +306,11 @@ static void runGnssFixCycle() {
                     northM, eastM, upM);
   ntripDisconnect();
   runTelemetryBatch(); // piggyback on the modem session this cycle already opened for NTRIP
+  // Can't call modemSleep() here directly - runTelemetryBatch() only kicked
+  // the MQTT batch off, it's still running on its own task (see modem.cpp)
+  // and cutting radio out from under it would break the AT command
+  // in-flight. loop() below actually sleeps once mqttBatchBusy() goes false.
+  modemSleepPending = true;
   gnssSleep();
 }
 
@@ -501,6 +507,15 @@ void loop() {
   // returned (see modem.cpp).
   if (mqttLastBatchOk()) {
     positionLogMarkSent();
+  }
+
+  // Deferred from runGnssFixCycle()'s end - only safe to cut radio once the
+  // async MQTT batch that cycle kicked off (if any) has actually finished,
+  // not merely been started. A cycle with nothing to publish clears this on
+  // the very next iteration, since mqttBatchBusy() is already false then.
+  if (modemSleepPending && !mqttBatchBusy()) {
+    modemSleepPending = false;
+    modemSleep();
   }
 
   runDailyUploadIfNeeded();

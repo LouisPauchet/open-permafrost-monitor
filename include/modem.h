@@ -10,6 +10,13 @@ bool modemInit();        // one-time: attach to the modem chip + PDP context
 bool modemConnect();     // ensure network-registered; cheap if already attached
 bool modemIsConnected();
 
+// Deregisters from the LTE-M network (NO_RF) between measurement cycles -
+// call once the async MQTT batch has actually finished (modemMqttBatchBusy()
+// false), not right after kicking it off. modemConnect() brings it back
+// (setOpState(FULL) + wait for registration) the next time it's needed, same
+// as gnss.h's gnssSleep()/gnssWakeup() pair.
+void modemSleep();
+
 // Raw TCP socket (used by ntrip_client.cpp for the RTCM stream). Only one
 // socket is used at a time.
 //

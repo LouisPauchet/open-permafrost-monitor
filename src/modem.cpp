@@ -287,6 +287,11 @@ bool modemConnect() {
     return true;
   }
 
+  // Coming back from modemSleep() (NO_RF between measurement cycles) lands
+  // here too, not just a genuinely fresh boot - radio has to be back on
+  // before registration can even begin.
+  modem.setOpState(WALTER_MODEM_OPSTATE_FULL);
+
   Serial.println(F("Modem: waiting for network registration..."));
   unsigned long start = millis();
   while (!isRegistered(modem.getNetworkRegState()) && millis() - start < 60000) {
@@ -296,6 +301,21 @@ bool modemConnect() {
   bool ok = isRegistered(modem.getNetworkRegState());
   Serial.println(ok ? F("Modem: registered.") : F("Modem: registration timed out."));
   return ok;
+}
+
+// Between measurement cycles the modem has nothing to do - no subscriptions,
+// no expected downlink, just telemetry it initiates itself - so there's no
+// reason to stay registered on the LTE-M network for the ~80% of each
+// measurement_interval_s cycle that isn't spent on an active NTRIP/MQTT
+// burst. Mirrors gnss.cpp's gnssSleep()/gnssWakeup() pattern (same
+// reasoning: don't let an idle peripheral dominate the power budget).
+// Must only be called once the async MQTT batch (see the dedicated task
+// above) has actually finished, not just been kicked off - see main.cpp's
+// modemSleepPending gating.
+void modemSleep() {
+  if (!modem.setOpState(WALTER_MODEM_OPSTATE_NO_RF)) {
+    Serial.println(F("Modem: setOpState(NO_RF) failed (sleep)."));
+  }
 }
 
 bool modemIsConnected() {
