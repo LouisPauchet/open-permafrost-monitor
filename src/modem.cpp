@@ -485,6 +485,27 @@ static char mqttTopic[64];
 static uint8_t mqttPayload[2048];
 static uint16_t mqttPayloadLen;
 
+// mqttConnect() returning true only means AT+SQNSMQTTCONNECT was accepted -
+// the actual broker handshake result arrives later via the
+// WALTER_MODEM_MQTT_EVENT_CONNECTED URC. Publishing right after mqttConnect()
+// returns raced that: it worked when incidental delay elsewhere happened to
+// give the handshake enough time, and failed outright (same "plain ERROR,
+// no CME code" shape as every other bug tonight) when it didn't - confirmed
+// intermittently on live hardware. open_renewable_lab hits this exact issue
+// (its own comment: "fails every time" without waiting) and blocks on a
+// semaphore signaled from this URC before publishing; mirrored here.
+static SemaphoreHandle_t mqttConnectDoneSem = nullptr;
+static volatile bool mqttConnectedOk = false;
+
+static void mqttEventHandler(WMMQTTEventType event, const WMMQTTEventData *data, void *args) {
+  if (event == WALTER_MODEM_MQTT_EVENT_CONNECTED) {
+    mqttConnectedOk = data && data->rc == 0;
+    if (mqttConnectDoneSem) {
+      xSemaphoreGive(mqttConnectDoneSem);
+    }
+  }
+}
+
 static void mqttTaskFn(void *) {
   for (;;) {
     // Blocks here (no busy-poll) until modemMqttPublishBatchAsync() has
@@ -503,12 +524,21 @@ static void mqttTaskFn(void *) {
     bool ok = false;
     if (!modem.mqttConfig(mqttClientId, userArg, passArg, mqttTlsProfile)) {
       Serial.println(F("MQTT: config failed."));
-    } else if (!modem.mqttConnect(mqttHost, mqttPort, 60)) {
-      Serial.println(F("MQTT: connect failed."));
-    } else if (!modem.mqttPublish(mqttTopic, mqttPayload, mqttPayloadLen, 1)) {
-      Serial.println(F("MQTT: publish failed."));
     } else {
-      ok = true;
+      mqttConnectedOk = false;
+      xSemaphoreTake(mqttConnectDoneSem, 0); // drain any stale pending signal
+      if (!modem.mqttConnect(mqttHost, mqttPort, 60)) {
+        Serial.println(F("MQTT: connect failed."));
+      } else if (xSemaphoreTake(mqttConnectDoneSem, pdMS_TO_TICKS(10000)) != pdTRUE) {
+        Serial.println(F("MQTT: connect timed out waiting for broker confirmation."));
+      } else if (!mqttConnectedOk) {
+        Serial.println(F("MQTT: broker rejected the connection."));
+      } else if (!modem.mqttPublish(mqttTopic, mqttPayload, mqttPayloadLen, 1)) {
+        Serial.println(F("MQTT: publish failed."));
+      } else {
+        ok = true;
+        Serial.println(F("MQTT: publish succeeded."));
+      }
     }
     // Always, win or lose - leaving a half-open session behind is exactly
     // what open_renewable_lab's be_connect() comment describes as wedging
@@ -533,6 +563,8 @@ bool modemMqttPublishBatchAsync(const char *host, uint16_t port, const char *cli
   }
 
   if (!mqttTaskHandle) {
+    mqttConnectDoneSem = xSemaphoreCreateBinary();
+    modem.setMQTTEventHandler(mqttEventHandler, nullptr);
     // Core 0 alongside the SD writer task - core 1 already carries
     // loopTask plus WalterModem's own queueProcessing/eventProcessing
     // tasks (see modem.cpp's design notes above). Stack sized well above
