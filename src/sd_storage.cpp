@@ -154,6 +154,7 @@ struct StreamState {
   char pendingHeader[128] = ""; // empty = no header requested for this open
   volatile bool openPending = false;
   volatile bool closePending = false;
+  volatile bool flushPending = false;
 };
 
 StreamRing g_ring[SD_STREAM_COUNT];
@@ -194,8 +195,33 @@ void sdWriterTaskFn(void *) {
       }
       xSemaphoreGive(ring.mutex);
 
-      if (n > 0 && st.file) {
-        st.file.write(local, n);
+      if (n > 0 && st.file && available) {
+        size_t written = st.file.write(local, n);
+        if (written != n) {
+          // Same failure class (and the same 0x107 SD_MMC error code) that
+          // motivated sdOpenForAppend()'s latch below - a card that starts
+          // failing writes mid-session is almost never a one-write glitch,
+          // and blindly retrying every 50ms drain cycle against an
+          // already-wedged card is exactly the unbounded SD_MMC I/O that's
+          // previously landed a task-watchdog abort on live hardware. This
+          // was previously unchecked entirely - a partial/failed write here
+          // was silently dropped (data loss with no log line and no
+          // backoff), not just "logged but fine". Latching `available`
+          // false stops every stream, matching the open-path's tradeoff:
+          // lose the rest of this boot's logging rather than keep risking
+          // another stall.
+          Serial.printf("SD writer: stream %d write failed (%u/%u bytes) - marking "
+                         "storage unavailable.\n",
+                         s, (unsigned)written, (unsigned)n);
+          available = false;
+        }
+      }
+
+      if (st.flushPending) {
+        st.flushPending = false;
+        if (st.file) {
+          st.file.flush();
+        }
       }
 
       if (st.closePending) {
@@ -261,6 +287,10 @@ void sdStreamWrite(SdStream stream, const uint8_t *data, size_t len) {
     ring.len += n;
   }
   xSemaphoreGive(ring.mutex);
+}
+
+void sdStreamFlush(SdStream stream) {
+  g_stream[stream].flushPending = true;
 }
 
 void sdStreamClose(SdStream stream) {

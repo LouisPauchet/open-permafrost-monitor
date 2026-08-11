@@ -29,6 +29,13 @@ struct DeviceConfig {
   // post-process.
   uint32_t ppk_min_duration_s;
 
+  // How long a commissioning run (field-service menu) averages GNSS fixes
+  // for before locking in the station's reference position - see
+  // reference_position.h. Default matches a real static-GNSS survey
+  // duration long enough to average out multipath/atmospheric error;
+  // shortened only for bench testing, never for a real deployment.
+  uint32_t reference_window_s;
+
   // Daily-file upload endpoint. One plain HTTPS POST per file (large files
   // chunked, see upload_client.h), authenticated with HTTP Basic auth using
   // upload_api_key as the username - a small backend the user runs
@@ -36,6 +43,17 @@ struct DeviceConfig {
   char upload_host[64];
   uint16_t upload_port;
   char upload_api_key[64];
+
+  // Below this (measured on BATTERY_EXTERNAL_ADC_PIN - see battery.h), new
+  // GNSS/modem bursts are skipped entirely - geophone/SD logging keeps
+  // running (comparatively low power), but the LTE modem and F9P (the two
+  // real power draws) stay off until solar charging recovers the pack.
+  // Default assumes a 12V lead-acid pack: ~11.8V is roughly 10-20%
+  // remaining, comfortably above the ~11.5V deep-discharge zone that
+  // shortens lead-acid lifespan, but under-load sag during an active burst
+  // may warrant a site-specific value once real discharge behavior is
+  // observed in the field.
+  float low_battery_cutoff_v;
 };
 
 extern DeviceConfig deviceConfig;

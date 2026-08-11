@@ -8,8 +8,11 @@
 
 void initPositionLog();
 
-// Appends one row for the current GNSS fix. Call once per measurement cycle.
-void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInternalV);
+// Appends one row for the current GNSS fix. Call once per measurement
+// cycle. hasDisplacement is false (and northM/eastM/upM ignored) until
+// reference_position.h has a locked reference to measure from.
+void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInternalV,
+                       bool hasDisplacement, float northM, float eastM, float upM);
 
 // Reads back rows appended since the last call to positionLogMarkSent(),
 // formatting them as a JSON array into buf. Returns the number of rows

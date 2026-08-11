@@ -1,5 +1,7 @@
 #include "field_service.h"
 #include "device_config.h"
+#include "reference_position.h"
+#include "battery.h"
 #include "pins.h"
 #include <SD_MMC.h>
 #include <stdlib.h>
@@ -64,6 +66,9 @@ static void printMenu() {
   Serial.println(F("8) List SD card files"));
   Serial.println(F("9) Download a file"));
   Serial.println(F("A) Set PPK minimum recording duration (s)"));
+  Serial.println(F("B) Set reference-position averaging window (s)"));
+  Serial.println(F("C) Start commissioning (establish reference position)"));
+  Serial.println(F("D) Set low-battery cutoff (V) - new bursts skipped below this"));
   Serial.println(F("0) Save and exit"));
   Serial.print(F("> "));
 }
@@ -74,11 +79,25 @@ static void showConfig() {
   Serial.printf("Fix timeout: %u s\n", (unsigned)deviceConfig.fix_timeout_s);
   Serial.printf("Good accuracy: %.3f m\n", deviceConfig.good_accuracy_m);
   Serial.printf("PPK minimum recording duration: %u s\n", (unsigned)deviceConfig.ppk_min_duration_s);
+  Serial.printf("Reference-position averaging window: %u s\n", (unsigned)deviceConfig.reference_window_s);
+  if (referencePositionIsLocked()) {
+    double lat, lon, alt;
+    referencePositionGet(&lat, &lon, &alt);
+    Serial.printf("Reference position: LOCKED at %.8f, %.8f, %.2fm\n", lat, lon, alt);
+  } else if (referencePositionIsCommissioning()) {
+    Serial.printf("Reference position: commissioning in progress (%u/%u s, %u samples)\n",
+                  (unsigned)referencePositionElapsedS(), (unsigned)deviceConfig.reference_window_s,
+                  (unsigned)referencePositionSampleCount());
+  } else {
+    Serial.println(F("Reference position: not commissioned yet."));
+  }
   Serial.printf("MQTT: %s:%u (client %s)\n", deviceConfig.mqtt_host, deviceConfig.mqtt_port,
                 deviceConfig.mqtt_client_id);
   Serial.printf("NTRIP: %s:%u/%s\n", deviceConfig.ntrip_host, deviceConfig.ntrip_port,
                 deviceConfig.ntrip_mountpoint);
   Serial.printf("Upload: %s:%u\n", deviceConfig.upload_host, deviceConfig.upload_port);
+  Serial.printf("Low-battery cutoff: %.2f V (currently reading %.2f V)\n",
+                deviceConfig.low_battery_cutoff_v, batteryExternalVoltage());
 }
 
 static void setMqtt() {
@@ -190,6 +209,32 @@ void runFieldService() {
       downloadFile();
     } else if (choice == "A" || choice == "a") {
       promptUInt("PPK minimum recording duration (s)", &deviceConfig.ppk_min_duration_s);
+    } else if (choice == "B" || choice == "b") {
+      promptUInt("Reference-position averaging window (s)", &deviceConfig.reference_window_s);
+    } else if (choice == "D" || choice == "d") {
+      promptFloat("Low-battery cutoff (V)", &deviceConfig.low_battery_cutoff_v);
+    } else if (choice == "C" || choice == "c") {
+      // Antenna needs to already be at its final, permanent mounting
+      // position before this is confirmed - the average this starts
+      // collecting becomes the permanent ground-movement benchmark for the
+      // life of the station, see reference_position.h.
+      Serial.printf("This will average GNSS fixes for %u s (back-to-back bursts, not the normal "
+                    "%u s cycle interval) to establish the permanent reference position. Confirm "
+                    "the antenna is at its final mounting location. Proceed? [y/N]: ",
+                    (unsigned)deviceConfig.reference_window_s,
+                    (unsigned)deviceConfig.measurement_interval_s);
+      String confirm = readLine();
+      confirm.toLowerCase();
+      if (confirm == "y" || confirm == "yes") {
+        saveDeviceConfig(); // persist reference_window_s in case it was just changed above
+        referencePositionStartCommissioning();
+        Serial.println(F("Commissioning started - rebooting into normal operation."));
+        Serial.flush();
+        delay(100);
+        ESP.restart();
+      } else {
+        Serial.println(F("Cancelled."));
+      }
     } else if (choice == "0") {
       saveDeviceConfig();
       Serial.println(F("Configuration saved."));

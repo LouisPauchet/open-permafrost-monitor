@@ -69,6 +69,18 @@ void sdStreamOpen(SdStream stream, const char *path, const char *headerIfEmpty =
 // actual SD write happens later, on the writer task.
 void sdStreamWrite(SdStream stream, const uint8_t *data, size_t len);
 
+// Requests that the writer task flush this stream's file as soon as it next
+// drains the ring buffer (still off-caller's-task, still non-blocking here)
+// instead of waiting for the periodic 5s sweep. FatFs updates the on-disk
+// directory entry (size, cluster chain) as part of f_sync/flush, so this
+// bounds how much of a stream can be lost or leave the filesystem
+// inconsistent if power is cut before the next periodic flush - worth the
+// extra SD_MMC round trip for a low-volume, high-value stream like the
+// position/displacement CSV (one row per measurement cycle), not worth it
+// for the continuous high-rate UBX/RTCM/MiniSEED streams which already get
+// the periodic sweep.
+void sdStreamFlush(SdStream stream);
+
 // Closes the stream's current file (flushing it in the process) once the
 // writer task has drained whatever's still in the ring buffer.
 void sdStreamClose(SdStream stream);

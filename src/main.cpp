@@ -13,6 +13,7 @@
 #include "sd_storage.h"
 #include "battery.h"
 #include "position_log.h"
+#include "reference_position.h"
 #include "modem.h"
 #include "ntrip_client.h"
 #include "mqtt_client.h"
@@ -40,11 +41,6 @@ static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 static const unsigned long GGA_FAILURE_RETRY_MS = 1500;
 static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
 static const unsigned long MINISEED_FLUSH_INTERVAL_MS = 5000;
-// Not user-configurable (kept out of the config menu per the "as few
-// parameters as possible" preference) - how often to wake the modem for a
-// batched MQTT publish, independent of the (usually shorter) GNSS fix
-// interval, so the modem doesn't need a fresh MQTT session every fix.
-static const unsigned long TELEMETRY_BATCH_INTERVAL_MS = 3600000UL; // 1 hour
 
 // Safety net for unattended field operation: if loop() (or anything it
 // blocks in) doesn't feed this for WATCHDOG_TIMEOUT_S, the ESP32 reboots
@@ -65,10 +61,16 @@ static const unsigned long TELEMETRY_BATCH_INTERVAL_MS = 3600000UL; // 1 hour
 static const uint32_t WATCHDOG_TIMEOUT_S = 60;
 
 static unsigned long lastFixCycleMs = 0;
-static unsigned long lastTelemetryMs = 0;
 static unsigned long lastMiniseedFlushMs = 0;
+static unsigned long lastBatteryCheckMs = 0;
 static char lastUploadedDate[9] = "";
 static bool firstFixCycleDone = false;
+static bool batteryOkForBurst = true;
+
+// Read no more than once every 30s - analogReadMilliVolts() is cheap, but
+// there's no reason to poll it every loop() iteration when the whole point
+// is a slow-moving pack voltage, not a fast signal.
+static const unsigned long BATTERY_CHECK_INTERVAL_MS = 30000;
 
 // CPOS (the network RTK service behind this NTRIP mount) documents that a
 // client must already have a regular fix - autonomous is fine - before
@@ -92,6 +94,37 @@ static void waitForInitialFix() {
     }
     delay(20);
   }
+}
+
+// Runs at the end of every fix cycle now, not on its own hourly timer - the
+// modem's already up for NTRIP every cycle anyway (measurement_interval_s,
+// usually ~10 min), so batching hourly to "avoid an extra wake" no longer
+// saves anything, and telemetry reaches the backend far sooner this way.
+// Async (see modem.cpp/mqtt_client.h): runs right after ntripDisconnect()'s
+// own async modemSocketClose(), so a blocking call here would land in
+// exactly the command-channel contention that's already cost a lost AT
+// command once before.
+static void runTelemetryBatch() {
+  static char payload[2048]; // must outlive the async publish - see modemMqttPublishBatchAsync()
+  size_t rows = positionLogReadUnsent(payload, sizeof(payload));
+  if (rows == 0) {
+    return;
+  }
+
+  if (mqttBatchBusy()) {
+    // Shouldn't normally happen (a whole burst separates one attempt from
+    // the next), but don't stomp the in-flight payload buffer if it does -
+    // these rows stay unsent and get picked up next cycle instead.
+    Serial.println(F("Telemetry: previous MQTT batch still in flight, skipping this cycle."));
+    return;
+  }
+
+  if (!modemIsConnected()) {
+    Serial.println(F("Telemetry: modem not connected, skipping this batch."));
+    return;
+  }
+
+  mqttPublishBatchAsync(payload, rows);
 }
 
 static void runGnssFixCycle() {
@@ -175,9 +208,18 @@ static void runGnssFixCycle() {
     }
 
     // The GST-enable command can land before the F9P is ready to process
-    // it, especially right after an EXTINT wake from backup mode - keep
-    // retrying until GST sentences are actually flowing.
-    if (!gnssHasAccuracyEstimate() && millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
+    // it, especially right after an EXTINT wake from backup mode - originally
+    // retried only until gnssHasAccuracyEstimate() went true, but live
+    // hardware showed hAcc then freezing at that first value for the rest
+    // of the cycle (qualityOk permanently false: "hAcc=X.XXXm ... good=no"
+    // never changing across 100+s of STATUS lines) - GST sentences
+    // apparently stop actually flowing at some point mid-cycle with no
+    // self-healing retry once isValid() had already gone true once.
+    // Resending unconditionally on the same cadence as RXM-RTCM/RTCM3-input
+    // below (an already-proven fix for the identical "silently stops,
+    // nothing notices" risk class) costs nothing and guarantees this can't
+    // wedge for an entire cycle again.
+    if (millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
       lastGstEnableRetry = millis();
       gnssEnableGST();
     }
@@ -239,29 +281,31 @@ static void runGnssFixCycle() {
   }
   Serial.printf("RTCM bytes forwarded: %u\n", ntripBytesForwarded());
 
-  positionLogAppend(qualityOk, batteryExternalVoltage(), batteryInternalVoltage());
-  ntripDisconnect();
-  gnssSleep();
-}
-
-static void runTelemetryBatch() {
-  static char payload[2048];
-  size_t rows = positionLogReadUnsent(payload, sizeof(payload));
-  if (rows == 0) {
-    return;
-  }
-
-  if (!modemConnect()) {
-    Serial.println(F("Telemetry: modem not connected, skipping this batch."));
-    return;
-  }
-
-  if (mqttConnectBroker()) {
-    if (mqttPublishBatch(payload, rows)) {
-      positionLogMarkSent();
+  // Only a fix good enough to be logged as "quality_ok" is trusted as a
+  // commissioning survey observation or a real displacement measurement -
+  // the same accuracy bar used everywhere else in this cycle, not a
+  // separate one.
+  float northM = 0, eastM = 0, upM = 0;
+  bool hasDisplacement = false;
+  if (qualityOk) {
+    if (referencePositionIsCommissioning()) {
+      referencePositionUpdate(gnssLatitude(), gnssLongitude(), gnssAltitude());
+      Serial.printf("Reference position: commissioning %u/%u s, %u samples.\n",
+                    (unsigned)referencePositionElapsedS(), (unsigned)deviceConfig.reference_window_s,
+                    (unsigned)referencePositionSampleCount());
+    } else if (referencePositionIsLocked()) {
+      hasDisplacement = referencePositionDisplacement(gnssLatitude(), gnssLongitude(), gnssAltitude(),
+                                                       &northM, &eastM, &upM);
+      Serial.printf("Displacement from reference: north=%.3fm east=%.3fm up=%.3fm\n", northM, eastM,
+                    upM);
     }
-    mqttDisconnectBroker();
   }
+
+  positionLogAppend(qualityOk, batteryExternalVoltage(), batteryInternalVoltage(), hasDisplacement,
+                    northM, eastM, upM);
+  ntripDisconnect();
+  runTelemetryBatch(); // piggyback on the modem session this cycle already opened for NTRIP
+  gnssSleep();
 }
 
 // /data/gnss/ holds many per-burst files a day (see gnss.cpp), not one
@@ -353,6 +397,7 @@ void setup() {
   esp_log_level_set("WalterModem", ESP_LOG_WARN);
 
   loadDeviceConfig();
+  referencePositionInit();
 
   sdStorageInit();
   sdWriterInit();
@@ -423,15 +468,38 @@ void loop() {
     miniseedFlush();
   }
 
-  if (!firstFixCycleDone || now - lastFixCycleMs >= deviceConfig.measurement_interval_s * 1000UL) {
+  if (now - lastBatteryCheckMs >= BATTERY_CHECK_INTERVAL_MS) {
+    lastBatteryCheckMs = now;
+    bool wasOk = batteryOkForBurst;
+    batteryOkForBurst = batteryExternalVoltage() >= deviceConfig.low_battery_cutoff_v;
+    if (wasOk && !batteryOkForBurst) {
+      Serial.printf("Battery: %.2fV below %.2fV cutoff - skipping new GNSS/modem bursts until "
+                    "it recovers (geophone/SD logging continues).\n",
+                    batteryExternalVoltage(), deviceConfig.low_battery_cutoff_v);
+    } else if (!wasOk && batteryOkForBurst) {
+      Serial.println(F("Battery: recovered above cutoff - resuming GNSS/modem bursts."));
+    }
+  }
+
+  // Commissioning wants back-to-back bursts (each one a real RTK-quality
+  // observation) rather than waiting out the normal measurement_interval_s
+  // between them - reaching reference_window_s of accumulated quality fixes
+  // this way instead of stretching over 10-minute-spaced cycles for days.
+  bool commissioning = referencePositionIsCommissioning();
+  if ((!firstFixCycleDone || commissioning ||
+       now - lastFixCycleMs >= deviceConfig.measurement_interval_s * 1000UL) &&
+      batteryOkForBurst) {
     firstFixCycleDone = true;
     lastFixCycleMs = now;
     runGnssFixCycle();
   }
 
-  if (now - lastTelemetryMs >= TELEMETRY_BATCH_INTERVAL_MS) {
-    lastTelemetryMs = now;
-    runTelemetryBatch();
+  // Cheap consuming check every iteration - true only once, right when an
+  // async batch kicked off by runTelemetryBatch() (see above) actually
+  // completes, which can be several loop() iterations after that call
+  // returned (see modem.cpp).
+  if (mqttLastBatchOk()) {
+    positionLogMarkSent();
   }
 
   runDailyUploadIfNeeded();
