@@ -110,19 +110,30 @@ static const uint8_t UBX_ENABLE_RXM_RTCM_UART1[] = {
 // UBX-RXM-PMREQ (class 0x02, id 0x41), 16-byte payload version, requesting
 // indefinite backup mode (duration=0), force+backup flags (0x06 - enters
 // backup even with USB attached, so bring-up over USB serial behaves the
-// same as field/battery operation), waking on EXTINT0 or UART RX activity
-// (whichever fires first - UART RX is a bring-up safety net in case EXTINT
-// wiring/polarity needs adjustment). Byte layout and wakeupSources bit
-// values (EXTINT0=0x20, UARTRX=0x08) verified against SparkFun's u-blox
-// GNSS Arduino library (src/SparkFun_u-blox_GNSS_Arduino_Library.cpp,
-// powerOffWithInterrupt()), checksum computed by hand.
-static const uint8_t UBX_PMREQ_BACKUP_EXTINT_UARTRX[] = {
+// same as field/battery operation), waking on EXTINT0 only. Byte layout and
+// wakeupSources bit values (EXTINT0=0x20, UARTRX=0x08) verified against
+// SparkFun's u-blox GNSS Arduino library
+// (src/SparkFun_u-blox_GNSS_Arduino_Library.cpp, powerOffWithInterrupt()),
+// checksum computed by hand.
+//
+// UARTRX was originally also set as a wake source ("a bring-up safety net
+// in case EXTINT wiring/polarity needs adjustment") - live hardware showed
+// this defeating sleep entirely: the module never actually stayed in backup
+// mode (gnssCharsProcessed() kept climbing throughout the "idle" period
+// between cycles, confirmed on a station that's supposed to sleep the F9P
+// ~80% of each measurement_interval_s). UART RX as a wake source means the
+// module treats *any* electrical activity on the shared line - not just a
+// valid command - as a wake trigger, including noise. EXTINT wake (see
+// gnssWakeup()) has been the actual, working, per-cycle wake mechanism the
+// whole time regardless; the "safety net" was never load-bearing and was
+// actively breaking sleep. Removed.
+static const uint8_t UBX_PMREQ_BACKUP_EXTINT[] = {
   0xB5, 0x62, 0x02, 0x41, 0x10, 0x00,
   0x00, 0x00, 0x00, 0x00,             // version, reserved
   0x00, 0x00, 0x00, 0x00,             // duration = 0 (indefinite)
   0x06, 0x00, 0x00, 0x00,             // flags: force | backup
-  0x28, 0x00, 0x00, 0x00,             // wakeupSources: EXTINT0 | UARTRX
-  0x81, 0xEB                          // checksum (CK_A, CK_B)
+  0x20, 0x00, 0x00, 0x00,             // wakeupSources: EXTINT0 only
+  0x79, 0xCB                          // checksum (CK_A, CK_B)
 };
 
 // Raw GGA line last seen from the F9P itself, relayed to the NTRIP caster
@@ -382,7 +393,7 @@ void initGNSS() {
 }
 
 void gnssSleep() {
-  GPSSerial.write(UBX_PMREQ_BACKUP_EXTINT_UARTRX, sizeof(UBX_PMREQ_BACKUP_EXTINT_UARTRX));
+  GPSSerial.write(UBX_PMREQ_BACKUP_EXTINT, sizeof(UBX_PMREQ_BACKUP_EXTINT));
   GPSSerial.flush();
 
   // End of this burst - close both capture streams (a stream never opened
