@@ -60,6 +60,15 @@ uint8_t gnssHour();
 uint8_t gnssMinute();
 uint8_t gnssSecond();
 uint16_t gnssMillisecond(); // sub-second, from TinyGPS++'s centisecond field
+// Unix epoch milliseconds (UTC) - for ThingsBoard's {"ts":...,"values":{...}}
+// telemetry format, which needs the actual reading time (not the MQTT
+// publish time, which can lag well behind it if a batch was delayed - see
+// position_log.cpp). Computed directly from the UTC y/m/d/h/m/s fields
+// above via a standalone civil-calendar algorithm rather than mktime(),
+// which assumes the C library's configured local timezone unless a caller
+// remembers to force UTC first - this way there's no such dependency to
+// get wrong.
+uint64_t gnssEpochMillis();
 
 const char *gnssLastGGA(); // raw $..GGA line as last seen from the module, "" if none yet
 uint32_t gnssCharsProcessed();

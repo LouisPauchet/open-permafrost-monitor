@@ -14,7 +14,7 @@ static size_t pendingOffset = 0; // file size as of the last positionLogReadUnse
 
 static const char *CSV_HEADER = "time,latitude,longitude,altitude,horizontal_accuracy,"
                                  "vertical_accuracy,fix_quality,quality_ok,battery_external_v,"
-                                 "battery_internal_v,ref_locked,north_m,east_m,up_m";
+                                 "battery_internal_v,ref_locked,north_m,east_m,up_m,epoch_ms";
 
 static void rotateIfNeeded() {
   if (!gnssHasDateTime()) {
@@ -58,14 +58,16 @@ void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInte
     gnssTimestamp(ts, sizeof(ts));
   }
 
-  char row[240];
-  int len = snprintf(row, sizeof(row), "%s,%.8f,%.8f,%.2f,%.3f,%.3f,%d,%s,%.2f,%.2f,%s,%.4f,%.4f,%.4f\n",
-                      ts, gnssLatitude(), gnssLongitude(), gnssAltitude(),
-                      gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f,
-                      gnssHasAccuracyEstimate() ? gnssVerticalAccuracy() : -1.0f, gnssFixQuality(),
-                      qualityOk ? "true" : "false", batteryExternalV, batteryInternalV,
-                      hasDisplacement ? "true" : "false", hasDisplacement ? northM : 0.0f,
-                      hasDisplacement ? eastM : 0.0f, hasDisplacement ? upM : 0.0f);
+  char row[256];
+  int len = snprintf(
+      row, sizeof(row), "%s,%.8f,%.8f,%.2f,%.3f,%.3f,%d,%s,%.2f,%.2f,%s,%.4f,%.4f,%.4f,%llu\n", ts,
+      gnssLatitude(), gnssLongitude(), gnssAltitude(),
+      gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f,
+      gnssHasAccuracyEstimate() ? gnssVerticalAccuracy() : -1.0f, gnssFixQuality(),
+      qualityOk ? "true" : "false", batteryExternalV, batteryInternalV,
+      hasDisplacement ? "true" : "false", hasDisplacement ? northM : 0.0f,
+      hasDisplacement ? eastM : 0.0f, hasDisplacement ? upM : 0.0f,
+      gnssHasDateTime() ? (unsigned long long)gnssEpochMillis() : 0ULL);
   if (len <= 0) {
     return;
   }
@@ -126,44 +128,52 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
       continue;
     }
 
-    char lineBuf[240];
+    char lineBuf[256];
     strncpy(lineBuf, line.c_str(), sizeof(lineBuf) - 1);
     lineBuf[sizeof(lineBuf) - 1] = '\0';
 
-    char *field[14];
+    char *field[15];
     int n = 0;
     char *tok = strtok(lineBuf, ",");
-    while (tok != nullptr && n < 14) {
+    while (tok != nullptr && n < 15) {
       field[n++] = tok;
       tok = strtok(nullptr, ",");
     }
-    if (n < 14) {
+    if (n < 15) {
       lastGoodPos = posAfterLine; // malformed/short line (e.g. the header row) - skip for good
       continue;
     }
 
+    // ThingsBoard's telemetry API only treats a message as timestamped by
+    // the actual reading time if it's shaped {"ts":<epoch ms>,"values":
+    // {...}} - a plain flat object gets stamped with the server's ingestion
+    // time instead, which is wrong here whenever a batch is delayed (e.g.
+    // picked up several cycles late after an SD-triggered reboot - see
+    // main.cpp/sd_storage.cpp). epoch_ms (field[14]) is written by
+    // positionLogAppend() from the GNSS UTC clock, not the publish time.
     JsonObject row = arr.add<JsonObject>();
-    row["time"] = field[0];
-    row["latitude"] = atof(field[1]);
-    row["longitude"] = atof(field[2]);
-    row["altitude"] = atof(field[3]);
-    row["horizontal_accuracy"] = atof(field[4]);
-    row["vertical_accuracy"] = atof(field[5]);
-    row["fix_quality"] = atoi(field[6]);
-    row["quality_ok"] = (strcmp(field[7], "true") == 0);
-    row["battery_external_v"] = atof(field[8]);
-    row["battery_internal_v"] = atof(field[9]);
+    row["ts"] = strtoull(field[14], nullptr, 10);
+    JsonObject values = row["values"].to<JsonObject>();
+    values["latitude"] = atof(field[1]);
+    values["longitude"] = atof(field[2]);
+    values["altitude"] = atof(field[3]);
+    values["horizontal_accuracy"] = atof(field[4]);
+    values["vertical_accuracy"] = atof(field[5]);
+    values["fix_quality"] = atoi(field[6]);
+    values["quality_ok"] = (strcmp(field[7], "true") == 0);
+    values["battery_external_v"] = atof(field[8]);
+    values["battery_internal_v"] = atof(field[9]);
     bool refLocked = (strcmp(field[10], "true") == 0);
-    row["ref_locked"] = refLocked;
+    values["ref_locked"] = refLocked;
     float northM = atof(field[11]);
     float eastM = atof(field[12]);
-    row["north_m"] = northM;
-    row["east_m"] = eastM;
-    row["up_m"] = atof(field[13]);
+    values["north_m"] = northM;
+    values["east_m"] = eastM;
+    values["up_m"] = atof(field[13]);
     // Derived, not stored separately on disk - dashboards generally want a
     // single at-a-glance "how far has it moved" figure alongside the
     // directional components.
-    row["horizontal_displacement_m"] = refLocked ? sqrtf(northM * northM + eastM * eastM) : 0.0f;
+    values["horizontal_displacement_m"] = refLocked ? sqrtf(northM * northM + eastM * eastM) : 0.0f;
 
     // Stop before this row would overflow the caller's buffer - publish the
     // valid, complete batch built so far now rather than a truncated one;

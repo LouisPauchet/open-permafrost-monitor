@@ -506,6 +506,25 @@ uint8_t gnssMinute() { return gps.time.minute(); }
 uint8_t gnssSecond() { return gps.time.second(); }
 uint16_t gnssMillisecond() { return gps.time.centisecond() * 10; }
 
+// Howard Hinnant's days_from_civil algorithm (public domain) - avoids any
+// mktime()/timezone dependency for a straightforward UTC-to-epoch
+// conversion.
+static int64_t daysFromCivilUTC(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+uint64_t gnssEpochMillis() {
+  int64_t days = daysFromCivilUTC(gnssYear(), gnssMonth(), gnssDay());
+  uint64_t secs =
+      (uint64_t)days * 86400ULL + gnssHour() * 3600ULL + gnssMinute() * 60ULL + gnssSecond();
+  return secs * 1000ULL + gnssMillisecond();
+}
+
 const char *gnssLastGGA() {
   return haveGGA ? lastGGA : "";
 }
