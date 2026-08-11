@@ -18,6 +18,15 @@ bool sdStorageAvailable();
 // rather than waiting for the next write to fail. Call every loop().
 void sdCheckCardPresence();
 
+// Polls SD_EJECT_BUTTON_PIN (debounced, see pins.h) - on a press, flushes
+// and closes every stream, unmounts SD_MMC, and cuts power to the card's
+// rail so it's genuinely safe to pull, not just "files are closed" (an SD
+// card's bus lines can still be mid-transaction electrically even with
+// every file handle closed). No separate "resume" step: re-inserting a
+// card is picked up by sdCheckCardPresence()'s existing remount path. Call
+// every loop().
+void sdCheckEjectButton();
+
 // Builds "/<prefix>_<dateYYYYMMDD>.<ext>" into buf.
 void sdBuildDailyPath(char *buf, size_t bufSize, const char *prefix,
                        const char *dateYYYYMMDD, const char *ext);

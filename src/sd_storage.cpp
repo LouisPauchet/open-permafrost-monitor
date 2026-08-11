@@ -7,6 +7,11 @@
 #include <string.h>
 
 static bool available = false;
+// Set by sdCheckEjectButton(), cleared once the card is actually detected
+// physically removed (or on the next boot) - prevents sdCheckCardPresence()
+// from immediately auto-remounting a card that's still sitting in the slot
+// right after it was deliberately powered down for removal.
+static bool ejected = false;
 
 bool sdStorageInit() {
   pinMode(SD_POWER_EN_PIN, OUTPUT);
@@ -16,6 +21,7 @@ bool sdStorageInit() {
   delay(50); // let the rail stabilize before the card sees clock/commands
 
   pinMode(SD_CARD_DETECT_PIN, INPUT); // sdCheckCardPresence() reads this every loop()
+  pinMode(SD_EJECT_BUTTON_PIN, INPUT_PULLUP); // sdCheckEjectButton() reads this every loop()
 
   SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN);
 
@@ -80,7 +86,7 @@ void sdCheckCardPresence() {
 
   if (present) {
     absentSinceMs = 0;
-    if (!available && !restartAttempted) {
+    if (!available && !restartAttempted && !ejected) {
       if (presentSinceMs == 0) {
         presentSinceMs = millis();
       } else if (millis() - presentSinceMs >= DEBOUNCE_MS) {
@@ -94,15 +100,52 @@ void sdCheckCardPresence() {
     }
   } else {
     presentSinceMs = 0;
-    if (available) {
+    if (available || ejected) {
       if (absentSinceMs == 0) {
         absentSinceMs = millis();
       } else if (millis() - absentSinceMs >= DEBOUNCE_MS) {
         Serial.println(F("SD: card removed - marking storage unavailable."));
         available = false;
+        ejected = false;
         restartAttempted = false; // a freshly (re)inserted card gets its own attempt
       }
     }
+  }
+}
+
+void sdCheckEjectButton() {
+  static unsigned long lowSince = 0;
+  static bool handledThisPress = false;
+  const unsigned long DEBOUNCE_MS = 200;
+
+  if (digitalRead(SD_EJECT_BUTTON_PIN) != LOW) {
+    lowSince = 0;
+    handledThisPress = false;
+    return;
+  }
+  if (lowSince == 0) {
+    lowSince = millis();
+    return;
+  }
+  if (handledThisPress || millis() - lowSince < DEBOUNCE_MS) {
+    return;
+  }
+  handledThisPress = true;
+
+  if (available) {
+    Serial.println(F("SD: eject button pressed - flushing and unmounting..."));
+    sdStorageCloseAllForReboot();
+    SD_MMC.end();
+    digitalWrite(SD_POWER_EN_PIN, HIGH); // active LOW enable - HIGH cuts power
+    available = false;
+    ejected = true;
+    Serial.println(F("SD: card unpowered - safe to remove now. Press the button again (or "
+                      "just reinsert a card) to resume."));
+  } else if (ejected) {
+    Serial.println(F("SD: eject button pressed again - rebooting to remount."));
+    Serial.flush();
+    delay(100);
+    ESP.restart();
   }
 }
 

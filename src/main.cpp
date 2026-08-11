@@ -457,6 +457,7 @@ void loop() {
   // Lets a technician swap the SD card without a manual power cycle - see
   // sd_storage.h.
   sdCheckCardPresence();
+  sdCheckEjectButton();
 
   unsigned long now = millis();
 

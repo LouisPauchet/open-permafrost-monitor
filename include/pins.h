@@ -33,6 +33,13 @@
 // exposed-but-unused UART0 (IO44/IO43).
 #define FIELD_MODE_SELECT_PIN 40
 
+// Momentary button to GND - flushes/closes every SD stream and cuts power
+// to the card's rail (SD_POWER_EN_PIN) so a technician can pull the card
+// without a hot-unplug mid-transaction (see sdCheckEjectButton() in
+// sd_storage.cpp). Re-inserting a card is picked up automatically by the
+// existing sdCheckCardPresence() remount path - no separate "resume" step.
+#define SD_EJECT_BUTTON_PIN 41
+
 // --- Battery monitoring ---
 #define BATTERY_EXTERNAL_ADC_PIN 2
 #define BATTERY_INTERNAL_ADC_PIN 1
