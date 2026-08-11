@@ -1,10 +1,12 @@
 #include "battery.h"
 #include "pins.h"
 
-// Placeholder divider ratios - calibrate once the real hardware's voltage
-// divider resistor values are known. A ratio of 2.0 assumes a simple 1:1
-// divider (actual voltage = 2x what the ADC pin reads).
-static const float EXTERNAL_DIVIDER_RATIO = 2.0f;
+// EXTERNAL_DIVIDER_RATIO is the real, measured carrier-board divider ratio
+// (pin 2) - actual battery voltage = ADC millivolts x this. INTERNAL is
+// still an uncalibrated placeholder (2.0 = simple 1:1 divider assumption);
+// calibrate once that divider's real resistor values are known, the same
+// way this one just was.
+static const float EXTERNAL_DIVIDER_RATIO = 6.4545454545454f;
 static const float INTERNAL_DIVIDER_RATIO = 2.0f;
 
 void initBattery() {
