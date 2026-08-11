@@ -51,11 +51,17 @@ void modemSuppressReceiveFor(unsigned long ms);
 // Consumes the flag: only reports failures new since the last check.
 bool modemLastSendFailed();
 
-// MQTT (used by mqtt_client.cpp for batched telemetry).
-bool modemMqttConnect(const char *host, uint16_t port, const char *clientId,
-                       const char *user, const char *pass, const char *caCert);
-bool modemMqttPublish(const char *topic, const uint8_t *payload, size_t len);
-void modemMqttDisconnect();
+// MQTT (used by mqtt_client.cpp for batched telemetry) - async, chaining
+// config->connect->publish->disconnect via callbacks. See modem.cpp for why
+// this isn't blocking like socketReceive/Send/Close used to not be either.
+// Returns true if the chain was successfully kicked off (config queued),
+// not that the publish itself succeeded - check modemMqttBatchBusy()/
+// modemMqttLastBatchOk() later for that.
+bool modemMqttPublishBatchAsync(const char *host, uint16_t port, const char *clientId,
+                                 const char *user, const char *pass, const char *caCert,
+                                 const char *topic, const uint8_t *payload, size_t len);
+bool modemMqttBatchBusy();
+bool modemMqttLastBatchOk(); // consumes: true only once, right when a batch succeeds
 
 // HTTP (used by upload_client.cpp for the daily upload POST). Auth is HTTP
 // Basic (api key as the username, empty password) rather than a bearer

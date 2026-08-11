@@ -4,13 +4,22 @@
 #include <WalterModem.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <string.h>
 
 static WalterModem modem;
 
 static const int MODEM_PDP_CTX = 1;
 static const int MODEM_SOCKET_ID = 1;
-static const uint8_t MODEM_CA_SLOT = 0; // shared Let's Encrypt root, both TLS profiles below
+// Slots 0-9 are reserved for Sequans/BlueCherry-internal use (confirmed both
+// in tlsWriteCredential()'s own doc comment - "recommended to save
+// credentials in index 10-19 to avoid overwriting preinstalled certificates"
+// - and empirically: this was the root cause of every "AT+SQNSMQTTCFG ...
+// ERROR" seen tonight referencing a TLS profile. Slot 0 (reserved) let
+// tlsWriteCredential/tlsConfigProfile both report success, but referencing
+// that profile from mqttConfig failed outright; open_renewable_lab (same
+// board/library) uses slot 12 and works. Matching that here.
+static const uint8_t MODEM_CA_SLOT = 12; // shared Let's Encrypt root, both TLS profiles below
 static const uint8_t MODEM_TLS_PROFILE_MQTT = 1;
 static const uint8_t MODEM_TLS_PROFILE_HTTP = 2;
 static const int MODEM_HTTP_PROFILE = 1;
@@ -241,14 +250,22 @@ bool modemInit() {
                   pdpRsp.result, pdpRsp.data.cmeError);
   }
 
-  // One shared CA credential (Let's Encrypt root, reused from the MQTT
-  // work) covers both the MQTT broker and the upload backend, assuming
-  // both present publicly-trusted certs.
-  modem.tlsWriteCredential(false, MODEM_CA_SLOT, ISRG_ROOT_X1_CA);
-  modem.tlsConfigProfile(MODEM_TLS_PROFILE_MQTT, WALTER_MODEM_TLS_VALIDATION_CA,
-                          WALTER_MODEM_TLS_VERSION_12, MODEM_CA_SLOT);
-  modem.tlsConfigProfile(MODEM_TLS_PROFILE_HTTP, WALTER_MODEM_TLS_VALIDATION_CA,
-                          WALTER_MODEM_TLS_VERSION_12, MODEM_CA_SLOT);
+  // One shared CA credential (Let's Encrypt root) covers both the MQTT
+  // broker and the upload backend, assuming both present publicly-trusted
+  // certs. Written to MODEM_CA_SLOT (10-19 range - see its definition for
+  // why 0-9 doesn't work).
+  if (!modem.tlsWriteCredential(false, MODEM_CA_SLOT, ISRG_ROOT_X1_CA)) {
+    Serial.println(F("Modem: tlsWriteCredential failed."));
+  }
+  WalterModemRsp tlsRsp;
+  if (!modem.tlsConfigProfile(MODEM_TLS_PROFILE_MQTT, WALTER_MODEM_TLS_VALIDATION_CA,
+                               WALTER_MODEM_TLS_VERSION_12, MODEM_CA_SLOT, 0xff, 0xff, &tlsRsp)) {
+    Serial.printf("Modem: tlsConfigProfile(MQTT) failed (result=%d).\n", tlsRsp.result);
+  }
+  if (!modem.tlsConfigProfile(MODEM_TLS_PROFILE_HTTP, WALTER_MODEM_TLS_VALIDATION_CA,
+                               WALTER_MODEM_TLS_VERSION_12, MODEM_CA_SLOT, 0xff, 0xff, &tlsRsp)) {
+    Serial.printf("Modem: tlsConfigProfile(HTTP) failed (result=%d).\n", tlsRsp.result);
+  }
 
   if (!modem.setOpState(WALTER_MODEM_OPSTATE_FULL)) {
     Serial.println(F("Modem: setOpState(FULL) failed."));
@@ -431,29 +448,141 @@ void modemSocketClose() {
   asyncGeneration++;
 }
 
-bool modemMqttConnect(const char *host, uint16_t port, const char *clientId,
-                       const char *user, const char *pass, const char *caCert) {
-  uint8_t tlsProfile = (caCert != nullptr && caCert[0] != '\0') ? MODEM_TLS_PROFILE_MQTT : 0;
+// --- MQTT publish (batched telemetry), off a dedicated task ---
+//
+// This originally chained mqttConfig->mqttConnect->mqttPublish->
+// mqttDisconnect via WalterModem's own async callback mechanism, each step
+// calling straight into the next from inside the previous step's callback.
+// That crashed live hardware: "***ERROR*** A stack overflow in task
+// queueProcessing has been detected." Every WalterModem callback runs ON
+// the library's own internal queueProcessing task, and chaining four AT
+// commands this way stacks all four calls' frames on top of each other
+// there instead of unwinding between steps - nothing in the library
+// suggests this is a supported usage pattern, and open_renewable_lab (same
+// board/library, confirmed working) does the opposite: plain sequential
+// *blocking* mqttConfig/mqttConnect/mqttPublish calls (no cb at all) from
+// its own caller task.
+//
+// Matching that here, but off loopTask (the only task esp_task_wdt watches,
+// see WATCHDOG_TIMEOUT_S in main.cpp) rather than calling these blocking
+// functions directly from it: a dedicated task - mirrors sd_storage.cpp's
+// writer task exactly, same reasoning - picks up a pending batch and runs
+// the whole sequence as ordinary blocking calls, so nothing stacks and nothing
+// can trip the watchdog even if the network stalls. loopTask only stages
+// the batch and notifies; modemMqttBatchBusy()/modemMqttLastBatchOk() are
+// unchanged so main.cpp needed no changes at all for this rewrite.
+static volatile bool mqttBatchInFlight = false;
+static volatile bool mqttBatchOkPending = false;
+static TaskHandle_t mqttTaskHandle = nullptr;
 
-  if (!modem.mqttConfig(clientId, (user && user[0]) ? user : NULL,
-                         (pass && pass[0]) ? pass : NULL, tlsProfile)) {
-    Serial.println(F("Modem: mqttConfig failed."));
+static char mqttHost[64];
+static uint16_t mqttPort;
+static char mqttClientId[32];
+static char mqttUser[64];
+static char mqttPass[64];
+static uint8_t mqttTlsProfile;
+static char mqttTopic[64];
+static uint8_t mqttPayload[2048];
+static uint16_t mqttPayloadLen;
+
+static void mqttTaskFn(void *) {
+  for (;;) {
+    // Blocks here (no busy-poll) until modemMqttPublishBatchAsync() has
+    // staged a batch and wakes this task with xTaskNotifyGive().
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // WalterModem::mqttConfig only emits username/password when *both*
+    // pointers are non-NULL - it won't send a lone username. ThingsBoard's
+    // convention (and this deployment's secrets.h) is username-as-token
+    // with a blank password, so an empty password must still be passed as
+    // "" here, not NULL, or the real username silently never reaches the
+    // AT command.
+    const char *userArg = mqttUser[0] ? mqttUser : NULL;
+    const char *passArg = userArg ? mqttPass : NULL;
+
+    bool ok = false;
+    if (!modem.mqttConfig(mqttClientId, userArg, passArg, mqttTlsProfile)) {
+      Serial.println(F("MQTT: config failed."));
+    } else if (!modem.mqttConnect(mqttHost, mqttPort, 60)) {
+      Serial.println(F("MQTT: connect failed."));
+    } else if (!modem.mqttPublish(mqttTopic, mqttPayload, mqttPayloadLen, 1)) {
+      Serial.println(F("MQTT: publish failed."));
+    } else {
+      ok = true;
+    }
+    // Always, win or lose - leaving a half-open session behind is exactly
+    // what open_renewable_lab's be_connect() comment describes as wedging
+    // the *next* mqttConfig() call outright.
+    modem.mqttDisconnect();
+
+    mqttBatchOkPending = ok;
+    mqttBatchInFlight = false; // batch is over either way
+  }
+}
+
+bool modemMqttPublishBatchAsync(const char *host, uint16_t port, const char *clientId,
+                                 const char *user, const char *pass, const char *caCert,
+                                 const char *topic, const uint8_t *payload, size_t len) {
+  if (mqttBatchInFlight) {
+    Serial.println(F("MQTT: previous batch still in flight, skipping this one."));
+    return false;
+  }
+  if (len > sizeof(mqttPayload)) {
+    Serial.println(F("MQTT: payload exceeds buffer - dropped."));
     return false;
   }
 
-  if (!modem.mqttConnect(host, port)) {
-    Serial.println(F("Modem: mqttConnect failed."));
-    return false;
+  if (!mqttTaskHandle) {
+    // Core 0 alongside the SD writer task - core 1 already carries
+    // loopTask plus WalterModem's own queueProcessing/eventProcessing
+    // tasks (see modem.cpp's design notes above). Stack sized well above
+    // what a single AT command round trip needs; the crash this replaces
+    // was exactly a stack-size problem, so this errs generous rather than
+    // matching queueProcessing's own (evidently too small for chaining)
+    // stack.
+    xTaskCreatePinnedToCore(mqttTaskFn, "mqttTask", 8192, NULL, 1, &mqttTaskHandle, 0);
   }
+
+  strncpy(mqttHost, host, sizeof(mqttHost) - 1);
+  mqttHost[sizeof(mqttHost) - 1] = '\0';
+  mqttPort = port;
+  if (clientId && clientId[0]) {
+    strncpy(mqttClientId, clientId, sizeof(mqttClientId) - 1);
+    mqttClientId[sizeof(mqttClientId) - 1] = '\0';
+  } else {
+    // AT+SQNSMQTTCFG rejects an empty client-id string outright, and
+    // brokers like ThingsBoard don't care what it's set to (auth is by
+    // username token) - secrets.h intentionally leaves MQTT_CLIENT_ID
+    // blank for that reason, so fall back to a MAC-derived id that's
+    // still unique per device instead of requiring it to be filled in.
+    uint64_t mac = ESP.getEfuseMac();
+    snprintf(mqttClientId, sizeof(mqttClientId), "walter-%04X%08X", (uint16_t)(mac >> 32),
+             (uint32_t)mac);
+  }
+  strncpy(mqttUser, (user && user[0]) ? user : "", sizeof(mqttUser) - 1);
+  mqttUser[sizeof(mqttUser) - 1] = '\0';
+  strncpy(mqttPass, (pass && pass[0]) ? pass : "", sizeof(mqttPass) - 1);
+  mqttPass[sizeof(mqttPass) - 1] = '\0';
+  mqttTlsProfile = (caCert != nullptr && caCert[0] != '\0') ? MODEM_TLS_PROFILE_MQTT : 0;
+  strncpy(mqttTopic, topic, sizeof(mqttTopic) - 1);
+  mqttTopic[sizeof(mqttTopic) - 1] = '\0';
+  memcpy(mqttPayload, payload, len);
+  mqttPayloadLen = (uint16_t)len;
+
+  mqttBatchInFlight = true;
+  xTaskNotifyGive(mqttTaskHandle);
   return true;
 }
 
-bool modemMqttPublish(const char *topic, const uint8_t *payload, size_t len) {
-  return modem.mqttPublish(topic, (uint8_t *)payload, (uint16_t)len);
+bool modemMqttBatchBusy() {
+  return mqttBatchInFlight;
 }
 
-void modemMqttDisconnect() {
-  modem.mqttDisconnect();
+// Consumes: true only once, right when a batch completes successfully.
+bool modemMqttLastBatchOk() {
+  bool ok = mqttBatchOkPending;
+  mqttBatchOkPending = false;
+  return ok;
 }
 
 // NOTE: httpSend's buffer parameter is uint16_t - capped at 65535 bytes per
