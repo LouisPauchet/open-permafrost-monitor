@@ -84,3 +84,16 @@ void sdStreamFlush(SdStream stream);
 // Closes the stream's current file (flushing it in the process) once the
 // writer task has drained whatever's still in the ring buffer.
 void sdStreamClose(SdStream stream);
+
+// Closes every stream and blocks (bounded by timeoutMs) until the writer
+// task confirms all of them are done - call this right before any
+// self-triggered ESP.restart() (see field_service.cpp, sd_storage.cpp's own
+// card-detect remount) so nothing is left open across the reset. A reset
+// the firmware itself decided to take is exactly the corruption risk this
+// exists to close off - see sdOpenForAppend()'s and the writer task's write
+// path's own comments for what's at stake (FAT metadata mid-update, not
+// just the newest unflushed bytes). Returns false (without hanging forever)
+// if the writer task doesn't confirm in time - the caller should still
+// proceed with its restart either way, this is a best-effort reduction of
+// the exposure window, not a guarantee.
+bool sdStorageCloseAllForReboot(unsigned long timeoutMs = 1000);

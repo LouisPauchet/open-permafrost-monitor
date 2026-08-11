@@ -2,6 +2,7 @@
 #include "device_config.h"
 #include "reference_position.h"
 #include "battery.h"
+#include "sd_storage.h"
 #include "pins.h"
 #include <SD_MMC.h>
 #include <stdlib.h>
@@ -229,6 +230,7 @@ void runFieldService() {
         saveDeviceConfig(); // persist reference_window_s in case it was just changed above
         referencePositionStartCommissioning();
         Serial.println(F("Commissioning started - rebooting into normal operation."));
+        sdStorageCloseAllForReboot();
         Serial.flush();
         delay(100);
         ESP.restart();
@@ -245,6 +247,7 @@ void runFieldService() {
   }
 
   Serial.println(F("Exiting field service mode - rebooting into normal operation."));
+  sdStorageCloseAllForReboot();
   Serial.flush();
   delay(100);
   ESP.restart();
@@ -259,6 +262,7 @@ void checkFieldModeTrigger() {
       lowSince = millis();
     } else if (millis() - lowSince >= DEBOUNCE_MS) {
       Serial.println(F("Service cable detected - rebooting into field service mode."));
+      sdStorageCloseAllForReboot();
       Serial.flush();
       delay(100);
       ESP.restart();

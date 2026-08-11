@@ -86,6 +86,7 @@ void sdCheckCardPresence() {
       } else if (millis() - presentSinceMs >= DEBOUNCE_MS) {
         restartAttempted = true;
         Serial.println(F("SD: card detected - rebooting to mount it cleanly."));
+        sdStorageCloseAllForReboot();
         Serial.flush();
         delay(100);
         ESP.restart();
@@ -236,8 +237,13 @@ void sdWriterTaskFn(void *) {
     // close()) so a crash mid-burst loses at most this interval's worth of
     // data rather than everything since the file was opened - same reason
     // main.cpp already does this for MiniSEED, just relocated off the loop
-    // task along with everything else here.
-    if (millis() - lastFlushMs >= 5000) {
+    // task along with everything else here. 2s (was 5s) after real-world
+    // testing showed repeated abrupt resets (dev-time reflashing, but also
+    // genuine SD card hiccups) losing/corrupting more than expected -
+    // shrinks the exposure window for the continuous high-rate UBX/RTCM/
+    // MiniSEED streams (positions CSV already flushes every row, see
+    // position_log.cpp).
+    if (millis() - lastFlushMs >= 2000) {
       lastFlushMs = millis();
       for (int s = 0; s < SD_STREAM_COUNT; s++) {
         if (g_stream[s].file) {
@@ -295,4 +301,33 @@ void sdStreamFlush(SdStream stream) {
 
 void sdStreamClose(SdStream stream) {
   g_stream[stream].closePending = true;
+}
+
+bool sdStorageCloseAllForReboot(unsigned long timeoutMs) {
+  for (int s = 0; s < SD_STREAM_COUNT; s++) {
+    sdStreamClose((SdStream)s);
+  }
+  unsigned long start = millis();
+  for (;;) {
+    bool allDone = true;
+    for (int s = 0; s < SD_STREAM_COUNT; s++) {
+      if (g_stream[s].closePending) {
+        allDone = false;
+        break;
+      }
+    }
+    if (allDone) {
+      return true;
+    }
+    if (millis() - start >= timeoutMs) {
+      // A wedged card (see the writer task's write-failure latch above)
+      // means the writer task itself could be stuck, or `available` may
+      // have already gone false, in which case closePending is consumed
+      // without any of the actual SD_MMC work - this timeout is only a
+      // safety net for a genuinely stuck case, not the normal path.
+      Serial.println(F("SD: close-all-for-reboot timed out - proceeding anyway."));
+      return false;
+    }
+    delay(20);
+  }
 }
