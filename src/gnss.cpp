@@ -143,6 +143,29 @@ static bool haveGGA = false;
 static char lineBuf[100];
 static uint8_t lineLen = 0;
 
+// gnssYear()/gnssHour()/etc. (and gnssEpochMillis(), built from them) return
+// TinyGPS++'s last-received value - it doesn't expire on its own (isValid()
+// is a sticky flag, confirmed against the library source, not an age check),
+// so those keep reporting whatever the wall clock was at the *last* fix
+// forever, including all through GNSS backup-mode sleep between cycles. A
+// caller that stamps something with "the current time" using them directly
+// (miniseed_writer.cpp did) gets the same frozen timestamp repeated for
+// every sample recorded during that entire idle window - confirmed on live
+// hardware: once GNSS sleep actually started working tonight (see
+// gnssSleep()'s own fix), the geophone's continuous recording requirement
+// broke as a direct, unintended side effect, because every idle-period
+// MiniSEED record collided at the same instant instead of advancing.
+// gnssEpochMillisNow()/gnssCivilNow() below extrapolate off millis() from
+// the last genuinely fresh fix instead, so time keeps advancing correctly
+// even while the F9P is asleep and not reporting at all.
+static uint64_t epochAnchorMs = 0;
+static unsigned long epochAnchorAtMillis = 0;
+static bool haveEpochAnchor = false;
+static uint16_t lastAnchoredYear = 0;
+static uint8_t lastAnchoredMonth = 0, lastAnchoredDay = 0, lastAnchoredHour = 0,
+               lastAnchoredMinute = 0, lastAnchoredSecond = 0;
+static void maybeUpdateEpochAnchor(); // defined below, after gnssEpochMillis()
+
 // Two capture files per GNSS burst (wake-to-sleep cycle, see
 // gnssWakeup()/gnssSleep()) under /data/gnss/, sharing one filename stamp
 // so they're trivially paired for PPK post-processing:
@@ -445,6 +468,8 @@ void pollGNSS() {
       lineBuf[lineLen++] = c;
     }
   }
+
+  maybeUpdateEpochAnchor();
 }
 
 void gnssWriteRTCM(const uint8_t *buf, size_t len) {
@@ -534,6 +559,90 @@ uint64_t gnssEpochMillis() {
   uint64_t secs =
       (uint64_t)days * 86400ULL + gnssHour() * 3600ULL + gnssMinute() * 60ULL + gnssSecond();
   return secs * 1000ULL + gnssMillisecond();
+}
+
+// Only re-anchors when the GNSS-reported wall clock has actually advanced
+// since the last call - re-anchoring unconditionally on every pollGNSS()
+// call (including the many calls during idle where the F9P has nothing new
+// to report at all) would just keep resetting epochAnchorAtMillis against
+// the same stale fields, which cancels out the millis() extrapolation this
+// exists to provide in the first place.
+static void maybeUpdateEpochAnchor() {
+  if (!gnssHasDateTime()) {
+    return;
+  }
+  uint16_t y = gnssYear();
+  uint8_t mo = gnssMonth(), d = gnssDay(), h = gnssHour(), mi = gnssMinute(), se = gnssSecond();
+  if (y == lastAnchoredYear && mo == lastAnchoredMonth && d == lastAnchoredDay &&
+      h == lastAnchoredHour && mi == lastAnchoredMinute && se == lastAnchoredSecond) {
+    return;
+  }
+  lastAnchoredYear = y;
+  lastAnchoredMonth = mo;
+  lastAnchoredDay = d;
+  lastAnchoredHour = h;
+  lastAnchoredMinute = mi;
+  lastAnchoredSecond = se;
+  epochAnchorMs = gnssEpochMillis();
+  epochAnchorAtMillis = millis();
+  haveEpochAnchor = true;
+}
+
+bool gnssHasEpochAnchor() {
+  return haveEpochAnchor;
+}
+
+// Unlike gnssEpochMillis() (a snapshot of TinyGPS++'s last-received, never-
+// expiring fields - frozen for as long as the F9P goes without reporting,
+// e.g. all through backup-mode sleep), this keeps advancing via millis()
+// extrapolation off the last genuinely fresh fix. Use this, not
+// gnssYear()/gnssHour()/etc. directly, for anything that needs "the actual
+// current time" spanning an idle period - see the comment on the anchor
+// statics above for what broke when miniseed_writer.cpp used the frozen
+// version.
+uint64_t gnssEpochMillisNow() {
+  if (!haveEpochAnchor) {
+    return 0;
+  }
+  return epochAnchorMs + (uint64_t)(millis() - epochAnchorAtMillis);
+}
+
+// Howard Hinnant's civil_from_days algorithm (public domain) - inverse of
+// daysFromCivilUTC() above.
+static void civilFromDaysUTC(int64_t z, int *y, unsigned *m, unsigned *d) {
+  z += 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097);                         // [0, 146096]
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+  int64_t yy = (int64_t)yoe + era * 400;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+  unsigned mp = (5 * doy + 2) / 153;                      // [0, 11]
+  unsigned dd = doy - (153 * mp + 2) / 5 + 1;             // [1, 31]
+  unsigned mm = mp < 10 ? mp + 3 : mp - 9;                // [1, 12]
+  *y = (int)(yy + (mm <= 2 ? 1 : 0));
+  *m = mm;
+  *d = dd;
+}
+
+// Broken-down UTC calendar fields for gnssEpochMillisNow() - what
+// miniseed_writer.cpp actually needs (SEED's BTIME format), without every
+// caller having to redo the epoch-ms -> civil-date conversion itself.
+void gnssCivilNow(uint16_t *year, uint8_t *month, uint8_t *day, uint8_t *hour, uint8_t *minute,
+                   uint8_t *second, uint16_t *milli) {
+  uint64_t ms = gnssEpochMillisNow();
+  uint64_t totalSecs = ms / 1000ULL;
+  *milli = (uint16_t)(ms % 1000ULL);
+  int64_t days = (int64_t)(totalSecs / 86400ULL);
+  uint32_t secOfDay = (uint32_t)(totalSecs % 86400ULL);
+  *hour = (uint8_t)(secOfDay / 3600);
+  *minute = (uint8_t)((secOfDay % 3600) / 60);
+  *second = (uint8_t)(secOfDay % 60);
+  int y;
+  unsigned m, d;
+  civilFromDaysUTC(days, &y, &m, &d);
+  *year = (uint16_t)y;
+  *month = (uint8_t)m;
+  *day = (uint8_t)d;
 }
 
 const char *gnssLastGGA() {

@@ -61,11 +61,17 @@ static ChannelBuffer *findChannel(const char *name) {
 }
 
 static void rotateIfNeeded() {
-  if (!sdStorageAvailable() || !gnssHasDateTime()) {
+  // gnssHasEpochAnchor()/gnssCivilNow() (not gnssHasDateTime()/
+  // gnssDateString()) - the latter freeze at the last fix and never expire,
+  // which is exactly what broke continuous recording here (see gnss.h).
+  if (!sdStorageAvailable() || !gnssHasEpochAnchor()) {
     return;
   }
+  uint16_t year, milli;
+  uint8_t month, day, hour, minute, second;
+  gnssCivilNow(&year, &month, &day, &hour, &minute, &second, &milli);
   char today[9];
-  gnssDateString(today, sizeof(today));
+  snprintf(today, sizeof(today), "%04u%02u%02u", year, month, day);
   if (strcmp(today, dailyDate) != 0) {
     char path[48];
     sdBuildDailyPath(path, sizeof(path), "data/geophones/geophone", today, "mseed");
@@ -165,16 +171,11 @@ void miniseedAddSample(const char *channel, int32_t sample) {
   }
 
   if (!ch->haveStart) {
-    if (!gnssHasDateTime()) {
+    if (!gnssHasEpochAnchor()) {
       return; // no absolute time yet (e.g. before the first GNSS fix) - drop until we have one
     }
-    ch->startYear = gnssYear();
-    ch->startMonth = gnssMonth();
-    ch->startDay = gnssDay();
-    ch->startHour = gnssHour();
-    ch->startMinute = gnssMinute();
-    ch->startSecond = gnssSecond();
-    ch->startMs = gnssMillisecond();
+    gnssCivilNow(&ch->startYear, &ch->startMonth, &ch->startDay, &ch->startHour, &ch->startMinute,
+                 &ch->startSecond, &ch->startMs);
     ch->haveStart = true;
   }
 

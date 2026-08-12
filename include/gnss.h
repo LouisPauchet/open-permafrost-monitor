@@ -70,5 +70,23 @@ uint16_t gnssMillisecond(); // sub-second, from TinyGPS++'s centisecond field
 // get wrong.
 uint64_t gnssEpochMillis();
 
+// gnssEpochMillis()/gnssYear()/etc. above snapshot TinyGPS++'s last-received
+// fields, which never expire on their own (isValid() is sticky, not an age
+// check) - they stay frozen at whatever the wall clock was at the *last*
+// fix for as long as the F9P goes without reporting, including all through
+// backup-mode sleep between measurement cycles. Anything that needs "the
+// actual current time" spanning an idle period - not just a snapshot from
+// whenever GNSS last talked - must use these instead: they extrapolate via
+// millis() off the last genuinely fresh fix, so time keeps advancing
+// correctly even while the module is asleep. miniseed_writer.cpp needs this
+// for continuous per-record timestamps; using the frozen versions there
+// caused every record during an idle window to collide at the same instant
+// (confirmed on live hardware once GNSS sleep itself started actually
+// working - see gnssSleep()'s own fix).
+bool gnssHasEpochAnchor(); // false until the first-ever fix, same as gnssHasDateTime() was used for
+uint64_t gnssEpochMillisNow();
+void gnssCivilNow(uint16_t *year, uint8_t *month, uint8_t *day, uint8_t *hour, uint8_t *minute,
+                   uint8_t *second, uint16_t *milli);
+
 const char *gnssLastGGA(); // raw $..GGA line as last seen from the module, "" if none yet
 uint32_t gnssCharsProcessed();
