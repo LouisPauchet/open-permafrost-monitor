@@ -2,8 +2,9 @@
 #include <Arduino.h>
 #include <FS.h>
 
-// SD_MMC-based storage (1-bit mode - see pins.h), mounted once at boot and
-// held powered continuously, since the geophone writes to it 24/7. Fixed
+// SD-over-SPI storage (see sd_storage.cpp for why - migrated off native
+// SDMMC), mounted once at boot and held powered continuously, since the
+// geophone writes to it 24/7. Fixed
 // layout: /data for CSV-style logs, /data/gnss for per-burst GNSS UBX/RTCM
 // captures, /data/geophones for the continuous MiniSEED stream (see
 // sdStorageInit()). Shared "daily file" path primitive used by every
@@ -73,6 +74,14 @@ void sdWriterInit();
 // again after a same-day reboot (currentDate resets, but the file and its
 // header don't) just skips it.
 void sdStreamOpen(SdStream stream, const char *path, const char *headerIfEmpty = nullptr);
+
+// True once the writer task has actually opened this stream's file - lets a
+// caller like position_log.cpp's day-rollover rotation notice a failed open
+// (e.g. a transient SD hiccup at the exact moment of rotation, confirmed on
+// live hardware: a positions.csv rotation raced the tail end of a GNSS
+// burst's SD writes) and retry, instead of silently disabling that stream
+// until the next reboot.
+bool sdStreamIsOpen(SdStream stream);
 
 // Appends data to the stream's ring buffer. Fast and non-blocking - the
 // actual SD write happens later, on the writer task.

@@ -1,10 +1,32 @@
 #include "sd_storage.h"
 #include "pins.h"
-#include <SD_MMC.h>
+#include <SD.h>
+#include <SPI.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <string.h>
+
+// Switched from native SDMMC to SD-over-SPI: repeated real-hardware failures
+// (sdmmc_send_cmd 0x107 timeouts, ~14 in one overnight session even at the
+// already-reduced 10MHz 1-bit SDMMC clock) on this board's "explicitly
+// provisional" SD wiring (see the old clock-speed comment this replaced).
+// SPI's timing/signal-integrity requirements are looser than native SD bus,
+// which tends to tolerate marginal wiring better - at the cost of throughput,
+// but this station's actual sustained write rate (400Hz geophone MiniSEED
+// continuously, plus RTCM/UBX only during the ~2min/10min GNSS burst) is on
+// the order of single-digit KB/s, nowhere near even a conservatively-clocked
+// SPI link's ceiling. Same physical pins as before - an SD card's DAT3/CMD/
+// CLK/DAT0 lines double as SPI's CS/MOSI/SCLK/MISO by design; only the host
+// init sequence decides which protocol the card runs (see SD_D3_PIN's old
+// comment about avoiding accidental SPI fallback in 1-bit SDMMC mode - D3 is
+// now deliberately driven as CS instead).
+static SPIClass sdSPI(HSPI);
+static const uint32_t SD_SPI_CLOCK_HZ = 4000000; // 4MHz - conservative for
+                                                   // signal-integrity margin,
+                                                   // not throughput (see
+                                                   // above); lower further if
+                                                   // failures persist.
 
 static bool available = false;
 // Set by sdCheckEjectButton(), cleared once the card is actually detected
@@ -23,30 +45,23 @@ bool sdStorageInit() {
   pinMode(SD_CARD_DETECT_PIN, INPUT); // sdCheckCardPresence() reads this every loop()
   pinMode(SD_EJECT_BUTTON_PIN, INPUT_PULLUP); // sdCheckEjectButton() reads this every loop()
 
-  SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN);
+  // begin(sck, miso, mosi, ss) - miso is the card's DAT0 line (card -> host),
+  // mosi is CMD (host -> card), ss is DAT3 (chip select).
+  sdSPI.begin(SD_CLK_PIN, SD_D0_PIN, SD_CMD_PIN, SD_D3_PIN);
 
-  // Arduino's SD_MMC.begin() defaults to SDMMC_FREQ_HIGHSPEED (40MHz,
-  // BOARD_MAX_SDMMC_FREQ in SD_MMC.h) unless told otherwise. This carrier
-  // board's SD wiring is explicitly provisional (see platformio.ini) and
-  // couldn't reliably mount at all at 40MHz, nor sustain real writes at
-  // 20MHz (confirmed on live hardware: mount succeeded but the first write
-  // failed with "sdmmc_send_cmd returned 0x109/0x107", CRC/timeout errors
-  // typical of marginal signal integrity) - 10MHz has run clean since.
-  static const int SD_CLOCK_FREQ_KHZ = 10000;
-  if (!SD_MMC.begin("/sdcard", true /* 1-bit mode */, false /* format_if_mount_failed */,
-                     SD_CLOCK_FREQ_KHZ)) {
+  if (!SD.begin(SD_D3_PIN, sdSPI, SD_SPI_CLOCK_HZ, "/sdcard", 5, false /* format_if_empty */)) {
     Serial.println(F("SD: mount failed."));
     available = false;
     return false;
   }
 
-  if (SD_MMC.cardType() == CARD_NONE) {
+  if (SD.cardType() == CARD_NONE) {
     Serial.println(F("SD: no card detected."));
     available = false;
     return false;
   }
 
-  Serial.printf("SD: mounted, %llu MB\n", SD_MMC.cardSize() / (1024ULL * 1024ULL));
+  Serial.printf("SD: mounted, %llu MB\n", SD.cardSize() / (1024ULL * 1024ULL));
   available = true;
 
   // Fixed layout: /data for CSV-style logs, /data/gnss for one UBX file per
@@ -54,9 +69,9 @@ bool sdStorageInit() {
   // only creates one level and isn't recursive, so /data has to exist
   // before its children; each call is idempotent (false on an
   // already-existing dir isn't an error, only matters on a fresh card).
-  SD_MMC.mkdir("/data");
-  SD_MMC.mkdir("/data/gnss");
-  SD_MMC.mkdir("/data/geophones");
+  SD.mkdir("/data");
+  SD.mkdir("/data/gnss");
+  SD.mkdir("/data/geophones");
 
   return true;
 }
@@ -135,7 +150,7 @@ void sdCheckEjectButton() {
   if (available) {
     Serial.println(F("SD: eject button pressed - flushing and unmounting..."));
     sdStorageCloseAllForReboot();
-    SD_MMC.end();
+    SD.end();
     digitalWrite(SD_POWER_EN_PIN, HIGH); // active LOW enable - HIGH cuts power
     available = false;
     ejected = true;
@@ -158,7 +173,7 @@ File sdOpenForAppend(const char *path) {
   if (!available) {
     return File();
   }
-  File f = SD_MMC.open(path, FILE_APPEND);
+  File f = SD.open(path, FILE_APPEND);
   if (!f) {
     Serial.printf("SD: failed to open %s for append.\n", path);
     // A card that failed to mount at all is caught by sdStorageInit()'s own
@@ -324,6 +339,10 @@ void sdStreamOpen(SdStream stream, const char *path, const char *headerIfEmpty) 
     st.pendingHeader[0] = '\0';
   }
   st.openPending = true;
+}
+
+bool sdStreamIsOpen(SdStream stream) {
+  return g_stream[stream].file && !g_stream[stream].openPending;
 }
 
 void sdStreamWrite(SdStream stream, const uint8_t *data, size_t len) {

@@ -2,7 +2,7 @@
 #include <esp_system.h>
 #include <esp_log.h>
 #include <esp_task_wdt.h>
-#include <SD_MMC.h> // for enumerating /data/gnss/*.ubx and *.rtcm in runDailyUploadIfNeeded()
+#include <SD.h> // for enumerating /data/gnss/*.ubx and *.rtcm in runDailyUploadIfNeeded()
 #include <string.h>
 
 #include "device_config.h"
@@ -337,7 +337,7 @@ static void runGnssFixCycle() {
 // gnssEnsureBurstStamp()) won't match anything and are never uploaded by
 // this - a known, accepted gap for that already-rare case.
 static void uploadGnssBurstFiles(const char *datePrefix) {
-  File dir = SD_MMC.open("/data/gnss");
+  File dir = SD.open("/data/gnss");
   if (!dir) {
     return;
   }

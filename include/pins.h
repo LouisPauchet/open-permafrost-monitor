@@ -14,14 +14,16 @@
 #define GEOPHONE_RX_PIN 15
 #define GEOPHONE_BAUD 230400 // see raspberry_shake.md - fixed, not configurable
 
-// --- SD card, native SDMMC 1-bit mode (not SPI) ---
-#define SD_CLK_PIN 12
-#define SD_CMD_PIN 11
-#define SD_D0_PIN 13
-// D3 must stay pulled up even in 1-bit mode, or the card silently falls
-// back to SPI mode - this pin is wired, not bit-banged by firmware.
-#define SD_D3_PIN 38
-#define SD_CARD_DETECT_PIN 39 // wired; not currently read by firmware
+// --- SD card, SPI mode (see sd_storage.cpp for why - moved off native
+// SDMMC after repeated real-hardware command-timeout failures) ---
+#define SD_CLK_PIN 12  // SPI SCLK
+#define SD_CMD_PIN 11  // SPI MOSI (host -> card)
+#define SD_D0_PIN 13   // SPI MISO (card -> host)
+#define SD_D3_PIN 38   // SPI CS - actively driven by the SD library now,
+                       // not just held pulled up the way native 1-bit SDMMC
+                       // mode needed it to avoid an unwanted SPI-mode
+                       // fallback (which is exactly the mode we're in now)
+#define SD_CARD_DETECT_PIN 39 // sdCheckCardPresence() reads this every loop()
 // 3V3_EN: switched 3.3V rail that powers the SD card. Active LOW (drive
 // low to enable). Held enabled continuously - geophone logging never
 // stops, so there's no per-cycle power-gating to do here.

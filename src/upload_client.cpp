@@ -1,13 +1,13 @@
 #include "upload_client.h"
 #include "device_config.h"
 #include "modem.h"
-#include <SD_MMC.h>
+#include <SD.h>
 #include <esp_task_wdt.h>
 
 static const size_t CHUNK_SIZE = 32768; // comfortably under httpSend's 65535-byte cap
 
 bool uploadFile(const char *localPath, const char *remoteFilename) {
-  File f = SD_MMC.open(localPath, FILE_READ);
+  File f = SD.open(localPath, FILE_READ);
   if (!f) {
     Serial.printf("Upload: cannot open %s\n", localPath);
     return false;

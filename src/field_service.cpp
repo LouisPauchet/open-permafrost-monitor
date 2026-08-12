@@ -4,7 +4,7 @@
 #include "battery.h"
 #include "sd_storage.h"
 #include "pins.h"
-#include <SD_MMC.h>
+#include <SD.h>
 #include <stdlib.h>
 
 bool fieldModeRequested() {
@@ -135,7 +135,7 @@ static void setUpload() {
 // would show nothing but an empty "data" entry now that every real file
 // lives under it.
 static bool listFilesIn(const char *dirPath) {
-  File dir = SD_MMC.open(dirPath);
+  File dir = SD.open(dirPath);
   if (!dir) {
     return false;
   }
@@ -166,7 +166,7 @@ static void downloadFile() {
   }
   String path = name.startsWith("/") ? name : "/" + name;
 
-  File f = SD_MMC.open(path, FILE_READ);
+  File f = SD.open(path, FILE_READ);
   if (!f) {
     Serial.println(F("File not found."));
     return;
