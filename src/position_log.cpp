@@ -2,7 +2,7 @@
 #include "sd_storage.h"
 #include "gnss.h"
 #include <ArduinoJson.h>
-#include <SD_MMC.h>
+#include <SD.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -23,6 +23,16 @@ static void rotateIfNeeded() {
   char today[9];
   gnssDateString(today, sizeof(today));
   if (strcmp(today, currentDate) == 0) {
+    // Already rotated to today - but if the open never actually landed
+    // (e.g. a transient SD hiccup right at rotation, seen on live hardware
+    // racing the tail end of a GNSS burst's own SD writes), retry here
+    // rather than leaving position logging silently stuck until the next
+    // reboot. Harmless to check every call: sdStreamIsOpen() is just a
+    // local flag read, and sdStreamOpen() is a no-op-cost request once the
+    // file is actually open (this branch is skipped entirely then).
+    if (currentPath[0] != '\0' && !sdStreamIsOpen(SD_STREAM_POSITIONS)) {
+      sdStreamOpen(SD_STREAM_POSITIONS, currentPath, CSV_HEADER);
+    }
     return;
   }
 
@@ -97,7 +107,7 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
     return 0;
   }
 
-  File f = SD_MMC.open(currentPath, FILE_READ);
+  File f = SD.open(currentPath, FILE_READ);
   if (!f) {
     return 0;
   }
