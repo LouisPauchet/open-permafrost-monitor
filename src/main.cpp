@@ -89,6 +89,15 @@ static void waitForInitialFix() {
     esp_task_wdt_reset();
     pollGeophone();
     pollGNSS();
+    // A burst can run 100+s - checkFieldModeTrigger()/sdCheckEjectButton()/
+    // sdCheckCardPresence() only being polled once per *outer* loop()
+    // iteration (as they still are for the idle-period case) meant a
+    // technician pressing either button mid-burst went unnoticed until the
+    // whole cycle finished - confirmed on live hardware. Polled here too so
+    // both react immediately regardless of what the cycle is doing.
+    checkFieldModeTrigger();
+    sdCheckEjectButton();
+    sdCheckCardPresence();
     if (millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
       lastGstEnableRetry = millis();
       gnssEnableGST();
@@ -182,6 +191,12 @@ static void runGnssFixCycle() {
     esp_task_wdt_reset();
     pollGeophone();
     pollGNSS();
+    // See waitForInitialFix()'s identical comment - this is the longer-
+    // running of the two burst loops (typically the ~110s+ one), so it's
+    // even more important these aren't only checked back in loop().
+    checkFieldModeTrigger();
+    sdCheckEjectButton();
+    sdCheckCardPresence();
 
     if (ntripUp) {
       ntripPoll();
