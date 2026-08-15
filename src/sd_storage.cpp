@@ -2,6 +2,7 @@
 #include "pins.h"
 #include <SD.h>
 #include <SPI.h>
+#include <USBMSC.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -392,4 +393,83 @@ bool sdStorageCloseAllForReboot(unsigned long timeoutMs) {
     }
     delay(20);
   }
+}
+
+// --- USB mass storage (field service mode only, see sd_storage.h) ---
+
+namespace {
+
+USBMSC usbMsc; // global on purpose - its constructor registers the MSC
+                // interface with TinyUSB's descriptor builder, which must
+                // happen before USB.begin() finalizes the composite
+                // descriptor; a global's constructor runs early enough
+                // (static init, before app_main/setup) to guarantee that
+                // regardless of where in setup() sdStorageMscBegin() runs.
+
+int32_t mscRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
+  if (!available) {
+    return -1;
+  }
+  uint8_t sector[512];
+  if (!SD.readRAW(sector, lba)) {
+    return -1;
+  }
+  uint32_t n = bufsize;
+  if (offset + n > sizeof(sector)) {
+    n = sizeof(sector) - offset; // clamp - shouldn't happen at native 512B blocks
+  }
+  memcpy(buffer, sector + offset, n);
+  return (int32_t)n;
+}
+
+int32_t mscWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
+  if (!available) {
+    return -1;
+  }
+  uint8_t sector[512];
+  // TinyUSB's MSC driver normally requests whole 512B blocks (offset=0,
+  // bufsize=512) - the read-modify-write below only matters for the rare
+  // partial-sector case, so a genuine full-block write skips the extra
+  // read.
+  if (offset != 0 || bufsize != sizeof(sector)) {
+    if (!SD.readRAW(sector, lba)) {
+      return -1;
+    }
+  }
+  uint32_t n = bufsize;
+  if (offset + n > sizeof(sector)) {
+    n = sizeof(sector) - offset;
+  }
+  memcpy(sector + offset, buffer, n);
+  if (!SD.writeRAW(sector, lba)) {
+    return -1;
+  }
+  return (int32_t)n;
+}
+
+bool mscStartStop(uint8_t /*power_condition*/, bool /*start*/, bool /*load_eject*/) {
+  return true;
+}
+
+} // namespace
+
+void sdStorageMscBegin() {
+  if (!available) {
+    return; // card never mounted - leave the LUN at its all-zero defaults
+  }
+  usbMsc.vendorID("WALTER");
+  usbMsc.productID("SD CARD");
+  usbMsc.productRevision("1.0");
+  usbMsc.onRead(mscRead);
+  usbMsc.onWrite(mscWrite);
+  usbMsc.onStartStop(mscStartStop);
+  usbMsc.begin((uint32_t)SD.numSectors(), (uint16_t)SD.sectorSize());
+}
+
+void sdStorageMscEnable() {
+  if (!available) {
+    return;
+  }
+  sdStorageCloseAllForReboot();
+  usbMsc.mediaPresent(true);
 }

@@ -3,6 +3,7 @@
 #include <esp_log.h>
 #include <esp_task_wdt.h>
 #include <SD.h> // for enumerating /data/gnss/*.ubx and *.rtcm in runDailyUploadIfNeeded()
+#include <USB.h> // composite CDC+MSC (see sd_storage.h's sdStorageMsc* functions)
 #include <string.h>
 
 #include "device_config.h"
@@ -399,6 +400,14 @@ static void runDailyUploadIfNeeded() {
 
 void setup() {
   Serial.begin(115200);
+  // Composite CDC+MSC (see sd_storage.h) - must run before the wait below,
+  // since with ARDUINO_USB_MODE=0 nothing enumerates on the USB bus at all
+  // (and Serial never becomes true) until USB.begin() actually brings the
+  // peripheral up. The MSC LUN itself isn't configured yet (that needs the
+  // card mounted first, see sdStorageMscBegin() below) - TinyUSB just reads
+  // its capacity/media-present state live on each host request, so it's
+  // safe to finalize the descriptor now and fill in real values later.
+  USB.begin();
   unsigned long serialWaitStart = millis();
   while (!Serial && millis() - serialWaitStart < 3000) {
     delay(10); // give the USB CDC host a moment to enumerate; don't hang forever if unplugged
@@ -421,6 +430,7 @@ void setup() {
   referencePositionInit();
 
   sdStorageInit();
+  sdStorageMscBegin();
   sdWriterInit();
   initBattery();
   initPositionLog();
@@ -448,6 +458,7 @@ void setup() {
   gnssSleep(); // idle until the first fix cycle in loop()
 
   if (fieldModeRequested()) {
+    sdStorageMscEnable();
     runFieldService();
   }
 

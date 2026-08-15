@@ -115,3 +115,24 @@ void sdStreamClose(SdStream stream);
 // proceed with its restart either way, this is a best-effort reduction of
 // the exposure window, not a guarantee.
 bool sdStorageCloseAllForReboot(unsigned long timeoutMs = 1000);
+
+// --- USB mass storage (field service mode only) ---
+//
+// Exposes the SD card as a USB drive on the same port as the console
+// (composite CDC+MSC, see platformio.ini's ARDUINO_USB_MODE=0), so a
+// technician can drag files off the card directly instead of the old
+// slow serial download. The MSC LUN is always present in the USB
+// descriptor once sdStorageMscBegin() runs (removing/adding USB
+// interfaces after enumeration isn't possible), but reports "no media"
+// until sdStorageMscEnable() is called - normal operation never calls
+// it, so the drive stays inert (and FatFs keeps sole ownership of the
+// card) outside field service mode.
+
+// Call once from setup(), after sdStorageInit() (needs the card's real
+// sector count/size) and before USB.begin().
+void sdStorageMscBegin();
+
+// Call when entering field service mode: closes every open FatFs stream
+// (a host doing raw sector I/O and firmware doing buffered FatFs I/O on
+// the same card at once would corrupt it) and marks the drive present.
+void sdStorageMscEnable();

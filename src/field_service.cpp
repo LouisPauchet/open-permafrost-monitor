@@ -4,7 +4,6 @@
 #include "battery.h"
 #include "sd_storage.h"
 #include "pins.h"
-#include <SD.h>
 #include <stdlib.h>
 
 bool fieldModeRequested() {
@@ -64,8 +63,6 @@ static void printMenu() {
   Serial.println(F("5) Set MQTT broker"));
   Serial.println(F("6) Set NTRIP caster"));
   Serial.println(F("7) Set upload endpoint"));
-  Serial.println(F("8) List SD card files"));
-  Serial.println(F("9) Download a file"));
   Serial.println(F("A) Set PPK minimum recording duration (s)"));
   Serial.println(F("B) Set reference-position averaging window (s)"));
   Serial.println(F("C) Start commissioning (establish reference position)"));
@@ -130,61 +127,9 @@ static void setUpload() {
   promptString("Upload API key", deviceConfig.upload_api_key, sizeof(deviceConfig.upload_api_key));
 }
 
-// Recurses one level deep, which is all the current /data/<subfolder>/file
-// layout (see sd_storage.cpp/gnss.cpp) needs - a flat listing of just "/"
-// would show nothing but an empty "data" entry now that every real file
-// lives under it.
-static bool listFilesIn(const char *dirPath) {
-  File dir = SD.open(dirPath);
-  if (!dir) {
-    return false;
-  }
-  File f = dir.openNextFile();
-  while (f) {
-    if (f.isDirectory()) {
-      listFilesIn(f.path());
-    } else {
-      Serial.printf("%-40s %10lu bytes\n", f.path(), (unsigned long)f.size());
-    }
-    f = dir.openNextFile();
-  }
-  dir.close();
-  return true;
-}
-
-static void listFiles() {
-  if (!listFilesIn("/")) {
-    Serial.println(F("SD card not available."));
-  }
-}
-
-static void downloadFile() {
-  Serial.print(F("Filename to download: "));
-  String name = readLine();
-  if (name.length() == 0) {
-    return;
-  }
-  String path = name.startsWith("/") ? name : "/" + name;
-
-  File f = SD.open(path, FILE_READ);
-  if (!f) {
-    Serial.println(F("File not found."));
-    return;
-  }
-
-  Serial.printf("BEGIN %s %lu\n", name.c_str(), (unsigned long)f.size());
-  uint8_t buf[512];
-  size_t n;
-  while ((n = f.read(buf, sizeof(buf))) > 0) {
-    Serial.write(buf, n);
-  }
-  f.close();
-  Serial.println();
-  Serial.println(F("END"));
-}
-
 void runFieldService() {
-  Serial.println(F("Field service mode - config menu + file download over this USB serial connection."));
+  Serial.println(F("Field service mode - config menu below; the SD card is also mounted as a "
+                    "USB drive on this same connection for direct file access."));
 
   while (digitalRead(FIELD_MODE_SELECT_PIN) == LOW) {
     printMenu();
@@ -204,10 +149,6 @@ void runFieldService() {
       setNtrip();
     } else if (choice == "7") {
       setUpload();
-    } else if (choice == "8") {
-      listFiles();
-    } else if (choice == "9") {
-      downloadFile();
     } else if (choice == "A" || choice == "a") {
       promptUInt("PPK minimum recording duration (s)", &deviceConfig.ppk_min_duration_s);
     } else if (choice == "B" || choice == "b") {
