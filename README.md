@@ -7,6 +7,11 @@ since the geophone streams 24/7): periodic RTK fixes via NTRIP, batched
 MQTT telemetry, and a daily push of the day's raw files to S3-compatible
 storage over the cellular link.
 
+**Building/wiring a station for the first time?** Start with
+[GETTING_STARTED.md](GETTING_STARTED.md) — a step-by-step wiring, flashing,
+and first-boot walkthrough. This document covers the *why* behind the
+system's behavior; that one covers the *what do I connect and type*.
+
 ## Hardware
 
 - Walter ESP32-S3 board (Sequans GM02SP LTE-M/NB-IoT modem, no WiFi used)
@@ -15,10 +20,11 @@ storage over the cellular link.
 - Raspberry Shake RS3D geophone digitizer (protocol reverse-engineered in
   [raspberry_shake.md](raspberry_shake.md)), UART, receive-only, fixed
   230400 baud
-- microSD card on the native SDMMC peripheral (1-bit mode, not SPI) —
-  **D3 needs a pull-up resistor even in 1-bit mode**, or the card falls back
-  to SPI mode and mounting fails
-- A 4-wire field-service cable (ground + the console/SD-access trigger pin)
+- microSD card over SPI (not native SDMMC — SDMMC's tighter signal-integrity
+  requirements kept hitting command timeouts on this carrier board's
+  provisional wiring; SPI's looser timing tolerates it reliably)
+- A momentary eject button, and a 4-wire field-service cable (ground + the
+  console/SD-access trigger pin)
 
 All pin assignments live in one place: [include/pins.h](include/pins.h).
 
@@ -26,7 +32,8 @@ All pin assignments live in one place: [include/pins.h](include/pins.h).
 |-----------------|---------------------------------------------------|
 | GNSS (UART2)    | RX 16, TX 17, EXTINT 18                            |
 | Geophone (UART1)| RX 15 (receive-only)                               |
-| SD (SDMMC)      | CLK 12, CMD 11, D0 13, D3 38, card-detect 39      |
+| SD (SPI)        | SCLK 12, MOSI 11, MISO 13, CS 38, card-detect 39   |
+| SD eject button | 41 (momentary, to GND)                             |
 | SD power        | 3V3_EN 0 (active LOW, held enabled continuously)   |
 | Field service   | select 40 (grounded by the service cable)          |
 | Battery ADC     | external 2, internal 1                             |
@@ -37,13 +44,13 @@ All pin assignments live in one place: [include/pins.h](include/pins.h).
 |------|-----------------|
 | [include/pins.h](include/pins.h) | All GPIO/UART pin assignments |
 | [include/device_config.h](include/device_config.h) / [src/device_config.cpp](src/device_config.cpp) | Field-configurable settings, persisted in NVS flash |
-| [include/field_service.h](include/field_service.h) / [src/field_service.cpp](src/field_service.cpp) | Text config menu + SD file download over native USB CDC |
+| [include/field_service.h](include/field_service.h) / [src/field_service.cpp](src/field_service.cpp) | Text config menu over USB CDC, composite with the SD-as-USB-drive mode (sd_storage.h) on the same port |
 | [include/modem.h](include/modem.h) / [src/modem.cpp](src/modem.cpp) | Thin wrapper around WalterModem: registration, async TCP socket (NTRIP), MQTT, HTTP |
 | [include/gnss.h](include/gnss.h) / [src/gnss.cpp](src/gnss.cpp) | ZED-F9P UART, NMEA parsing, fix quality/accuracy, EXTINT sleep/wake |
 | [include/ntrip_client.h](include/ntrip_client.h) / [src/ntrip_client.cpp](src/ntrip_client.cpp) | NTRIP caster connection (with retry), RTCM forwarding, GGA relay |
 | [include/geophone.h](include/geophone.h) / [src/geophone.cpp](src/geophone.cpp) | RS3D UART reader, continuous JSON sample stream parser |
 | [include/miniseed_writer.h](include/miniseed_writer.h) / [src/miniseed_writer.cpp](src/miniseed_writer.cpp) | Minimal MiniSEED writer, GNSS-timestamped |
-| [include/sd_storage.h](include/sd_storage.h) / [src/sd_storage.cpp](src/sd_storage.cpp) | SD_MMC mount, daily-rotated file helpers shared by every logger |
+| [include/sd_storage.h](include/sd_storage.h) / [src/sd_storage.cpp](src/sd_storage.cpp) | SD-over-SPI mount, daily-rotated file helpers shared by every logger, eject button, USB mass-storage exposure for field service mode |
 | [include/position_log.h](include/position_log.h) / [src/position_log.cpp](src/position_log.cpp) | Daily position CSV — also the MQTT batch buffer |
 | [include/battery.h](include/battery.h) / [src/battery.cpp](src/battery.cpp) | Internal/external battery voltage via ADC |
 | [include/mqtt_client.h](include/mqtt_client.h) / [src/mqtt_client.cpp](src/mqtt_client.cpp) | Batched MQTTS telemetry publish |
@@ -53,31 +60,62 @@ All pin assignments live in one place: [include/pins.h](include/pins.h).
 | [include/secrets.h](include/secrets.h) (git-ignored, copy from `secrets.h.example`) | Compiled-in **seed defaults** loaded into NVS on first boot only |
 | [lib/WalterModem/](lib/WalterModem/) | Vendored copy of `quickspot/WalterModem` 1.5.0 with two crash-fix patches — see [lib/WalterModem/README-PATCH.md](lib/WalterModem/README-PATCH.md) |
 
-## Why no deep sleep
+## Power management
 
 The geophone streams continuously at 230400 baud with no way to pause it, so
-the CPU can never sleep. `loop()` runs forever, servicing the geophone and
-GNSS UARTs every single iteration, with everything else (GNSS fix cycles,
-telemetry batches, daily uploads) scheduled off its own `millis()` timer.
-Low power now comes from keeping the modem and GNSS idle as much as
-possible while the CPU stays up for the geophone, not from CPU sleep.
+the CPU can never deep-sleep. `loop()` runs forever, servicing the geophone
+and GNSS UARTs every single iteration, with everything else (GNSS fix
+cycles, telemetry batches, daily uploads) scheduled off its own `millis()`
+timer. Instead, the two genuinely power-hungry peripherals are put to sleep
+between measurement cycles:
+
+- **GNSS**: the F9P goes into `UBX-RXM-PMREQ` backup mode (`gnssSleep()`)
+  right after each fix cycle, woken by a pulse on its EXTINT pin
+  (`gnssWakeup()`) at the start of the next one. The wake-source mask is
+  EXTINT-only — an earlier revision also armed UART RX as a wake source as
+  a bring-up safety net, but that meant any electrical noise on the shared
+  UART line (not just a real wake pulse) kept the module from actually
+  sleeping, confirmed on live hardware.
+- **Modem**: dropped to `NO_RF` opstate (`modemSleep()`) once a cycle's
+  NTRIP/MQTT work is done, brought back to `FULL` at the start of the next
+  cycle.
+- **Low-battery backoff**: below `low_battery_cutoff_v` (external battery
+  ADC), new GNSS/modem bursts are skipped entirely until the pack recovers
+  — geophone/SD logging (comparatively low draw) keeps running regardless.
+
+Time itself has the same "frozen while asleep" problem as the RF
+peripherals: GNSS's own UTC fields don't update while the F9P is asleep, so
+anything that needs continuously-advancing time across a sleep window (the
+geophone's own MiniSEED record timestamps) extrapolates from the last fix
+via `millis()` instead of reading the GNSS fields directly — see
+`gnssEpochMillisNow()`/`gnssCivilNow()` in [include/gnss.h](include/gnss.h).
 
 ## Field service mode
 
 Grounding the field-service select pin (cable's 4th wire) — either at boot,
 or at any point during normal operation — reboots the device straight into
-a text menu over native USB serial (115200 8N1). No physical reset needed;
-unplugging the cable (or `0) Save and exit`) reboots back into normal
-operation. From there a technician can:
+a text config menu over USB. No physical reset needed; unplugging the cable
+(or `0) Save and exit`) reboots back into normal operation. From there a
+technician can adjust the GNSS measurement interval, fix timeout, and
+good-accuracy threshold; set MQTT/NTRIP/upload-endpoint credentials (stored
+in NVS, survives reflashing); and start reference-position commissioning.
 
-- Adjust the GNSS measurement interval, fix timeout, and good-accuracy
-  threshold
-- Set MQTT / NTRIP / upload-endpoint credentials (stored in NVS, survives
-  reflashing)
-- List and download files off the SD card, streamed over the same serial
-  connection (`BEGIN <name> <size>` … raw bytes … `END`) — true USB mass
-  storage wasn't possible without forking the SD_MMC library, so this is
-  the alternative
+The same USB connection also exposes the SD card as an ordinary Windows/
+Mac/Linux drive, at the same time as the console (composite CDC+MSC —
+see `ARDUINO_USB_MODE=0` in `platformio.ini`), so a technician can just
+drag files off the card directly instead of the old serial download
+protocol. The drive only becomes usable once field service mode is
+entered: normal operation still owns the card via FatFs, and having a host
+do raw sector I/O at the same time would corrupt it, so
+`sdStorageMscEnable()` closes every open FatFs stream and only then marks
+the drive present (`sd_storage.cpp`). The MSC interface itself is always
+present in the USB descriptor (interfaces can't be added after
+enumeration), it just reports "no media" outside field service mode.
+
+Independent of field service mode, the physical eject button
+(`SD_EJECT_BUTTON_PIN`) flushes and closes every open stream, unmounts the
+card, and cuts power to its rail — for physically swapping the card without
+a hot-unplug mid-write. Press again (or just reinsert a card) to remount.
 
 Kept deliberately minimal (per the "as few parameters as possible"
 preference) — most tuning happens through `secrets.h` at flash time.
@@ -96,18 +134,23 @@ On the configured `measurement_interval_s`:
 4. Poll until horizontal accuracy (from the receiver's own GST error
    estimate) meets the configured threshold, or the fix timeout elapses.
 5. Append a row to the day's position CSV (time, lat/lon/alt, accuracy,
-   fix quality, battery voltages).
-6. Disconnect NTRIP, send the F9P back into backup mode.
-
-GNSS sleep/wake uses the same EXTINT + `UBX-RXM-PMREQ` mechanism as before;
-UART RX activity is also configured as a wake source as a bring-up safety
-net in case EXTINT wiring/polarity ever needs adjustment.
+   fix quality, battery voltages, reference-position displacement if
+   commissioned).
+6. Publish any unsent position rows as one MQTT batch (piggybacking on the
+   modem session already open for NTRIP - see Telemetry below).
+7. Disconnect NTRIP, send the F9P back into backup mode, drop the modem to
+   `NO_RF` - see Power management above.
 
 ## Telemetry and daily upload
 
-- **MQTT**: batched, not per-fix — connects once per hour (not
-  user-configurable, to keep the modem idle more) and publishes every
-  position_log row appended since the last batch as one JSON array message.
+- **MQTT**: batched, not per-fix, but published at the end of every fix
+  cycle rather than on a separate timer — the modem's already up for NTRIP
+  every cycle anyway (`measurement_interval_s`, usually ~10 min), so
+  waiting longer wouldn't save a wake, only delay data reaching the
+  backend. Every position_log row appended since the last successful batch
+  goes out as one message; async (doesn't block the fix cycle), and rows
+  that fail to send (modem down, batch already in flight) stay unsent and
+  retry next cycle.
 - **Daily upload**: on GNSS-date rollover, POSTs the previous day's four
   rotated files (geophone MiniSEED, GNSS raw log, NTRIP raw log, position
   CSV) in 32KB chunks to a backend the user runs themselves, authenticated
@@ -117,24 +160,41 @@ net in case EXTINT wiring/polarity ever needs adjustment.
 
 ## MQTT payload
 
+ThingsBoard-style `{"ts": ..., "values": {...}}` per row (a flat object
+gets stamped with the server's ingestion time instead of the actual
+reading time, which matters whenever a batch is delayed) - sent as a JSON
+array of one such object per unsent position:
+
 ```json
-{
-  "time": "2026-07-14T12:34:56Z",
-  "latitude": 78.2232012,
-  "longitude": 15.6512034,
-  "altitude": 12.34,
-  "fix_quality": 4,
-  "satellites": 22,
-  "horizontal_accuracy": 0.031,
-  "vertical_accuracy": 0.048,
-  "quality_ok": true
-}
+[
+  {
+    "ts": 1786790096000,
+    "values": {
+      "latitude": 78.2232012,
+      "longitude": 15.6512034,
+      "altitude": 12.34,
+      "horizontal_accuracy": 0.031,
+      "vertical_accuracy": 0.048,
+      "fix_quality": 4,
+      "quality_ok": true,
+      "battery_external_v": 12.61,
+      "battery_internal_v": 4.11,
+      "has_displacement": true,
+      "north_m": 0.012,
+      "east_m": -0.004,
+      "up_m": -0.031,
+      "horizontal_displacement_m": 0.0127
+    }
+  }
+]
 ```
 
-Sent as a JSON array of rows per batch. `fix_quality` follows the standard
-NMEA GGA fix indicator (0=no fix, 1=autonomous, 2=DGPS, 4=RTK fixed,
-5=RTK float). `quality_ok` reflects whether `horizontal_accuracy` met the
-configured threshold before the wait timed out.
+`fix_quality` follows the standard NMEA GGA fix indicator (0=no fix,
+1=autonomous, 2=DGPS, 4=RTK fixed, 5=RTK float). `quality_ok` reflects
+whether `horizontal_accuracy` met the configured threshold before the wait
+timed out. `has_displacement`/`north_m`/`east_m`/`up_m` are only meaningful
+once a reference position has been commissioned (field service menu);
+`horizontal_displacement_m` is derived (not stored), `sqrt(north² + east²)`.
 
 ## Build & flash
 
@@ -160,8 +220,13 @@ Upload / Monitor buttons)
   response parser, hit reproducibly under bursty NTRIP traffic) — vendored
   locally with a fix rather than pulled from the registry; see
   [lib/WalterModem/README-PATCH.md](lib/WalterModem/README-PATCH.md).
-- SD card mount currently fails (`0x107`) on the physical carrier board —
-  suspected missing/insufficient pull-up on the D3 line (see the comment in
-  `pins.h`); needs hardware inspection, not a firmware fix.
+- The USB console can miss the first few lines printed right after a fresh
+  connection (e.g. reopening `pio device monitor` right after a flash) -
+  `setup()` waits for `Serial` to report connected before printing
+  anything, but that only means the host's DTR line is asserted, not that
+  its terminal application has actually started reading bytes yet. Cosmetic
+  only (nothing depends on those lines being seen); if it matters for a
+  specific debugging session, reconnect once more or add a short fixed
+  delay before the first print.
 - `secrets.h` is git-ignored; only `secrets.h.example` (with placeholder
   values) is committed.
