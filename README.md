@@ -49,7 +49,7 @@ All pin assignments live in one place: [include/pins.h](include/pins.h).
 | [include/gnss.h](include/gnss.h) / [src/gnss.cpp](src/gnss.cpp) | ZED-F9P UART, NMEA parsing, fix quality/accuracy, EXTINT sleep/wake |
 | [include/ntrip_client.h](include/ntrip_client.h) / [src/ntrip_client.cpp](src/ntrip_client.cpp) | NTRIP caster connection (with retry), RTCM forwarding, GGA relay |
 | [include/geophone.h](include/geophone.h) / [src/geophone.cpp](src/geophone.cpp) | RS3D UART reader, continuous JSON sample stream parser |
-| [include/miniseed_writer.h](include/miniseed_writer.h) / [src/miniseed_writer.cpp](src/miniseed_writer.cpp) | Minimal MiniSEED writer, GNSS-timestamped |
+| [include/miniseed_writer.h](include/miniseed_writer.h) / [src/miniseed_writer.cpp](src/miniseed_writer.cpp) | Minimal MiniSEED writer, sample-clock timed and mapped to GNSS UTC |
 | [include/sd_storage.h](include/sd_storage.h) / [src/sd_storage.cpp](src/sd_storage.cpp) | SD-over-SPI mount, daily-rotated file helpers shared by every logger, eject button, USB mass-storage exposure for field service mode |
 | [include/position_log.h](include/position_log.h) / [src/position_log.cpp](src/position_log.cpp) | Daily position CSV — also the MQTT batch buffer |
 | [include/battery.h](include/battery.h) / [src/battery.cpp](src/battery.cpp) | Internal/external battery voltage via ADC |
@@ -63,10 +63,11 @@ All pin assignments live in one place: [include/pins.h](include/pins.h).
 ## Power management
 
 The geophone streams continuously at 230400 baud with no way to pause it, so
-the CPU can never deep-sleep. `loop()` runs forever, servicing the geophone
-and GNSS UARTs every single iteration, with everything else (GNSS fix
-cycles, telemetry batches, daily uploads) scheduled off its own `millis()`
-timer. Instead, the two genuinely power-hungry peripherals are put to sleep
+the CPU can never deep-sleep. The geophone runs on its own FreeRTOS task
+(UART drain, packet parsing, MiniSEED encoding), so nothing blocking on
+`loop()` can make it lose samples. `loop()` runs forever, servicing the GNSS
+UART, with everything else (GNSS fix cycles, telemetry batches, daily
+uploads) scheduled off its own `millis()` timer. Instead, the two genuinely power-hungry peripherals are put to sleep
 between measurement cycles:
 
 - **GNSS**: the F9P goes into `UBX-RXM-PMREQ` backup mode (`gnssSleep()`)
@@ -85,10 +86,18 @@ between measurement cycles:
 
 Time itself has the same "frozen while asleep" problem as the RF
 peripherals: GNSS's own UTC fields don't update while the F9P is asleep, so
-anything that needs continuously-advancing time across a sleep window (the
-geophone's own MiniSEED record timestamps) extrapolates from the last fix
-via `millis()` instead of reading the GNSS fields directly — see
-`gnssEpochMillisNow()`/`gnssCivilNow()` in [include/gnss.h](include/gnss.h).
+anything that needs continuously-advancing time across a sleep window
+extrapolates from the last fix via `millis()` instead of reading the GNSS
+fields directly — see `gnssEpochMillisNow()`/`gnssCivilNow()` in
+[include/gnss.h](include/gnss.h).
+
+MiniSEED record times come from the digitizer's own sample clock: its
+`MSEC` cycle marker is mapped onto that GNSS-extrapolated UTC, and each
+channel advances by exactly one sample interval per sample, so records are
+contiguous. The clock is only re-synced (and a line logged) on a real
+discontinuity — see [include/geophone_timing.h](include/geophone_timing.h).
+The constant latency between sampling and the marker reaching the ESP32 is
+not calibrated out.
 
 ## Field service mode
 

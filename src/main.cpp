@@ -41,7 +41,6 @@ static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 // instead of waiting a full GGA_RESEND_INTERVAL_MS - see modemLastSendFailed().
 static const unsigned long GGA_FAILURE_RETRY_MS = 1500;
 static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
-static const unsigned long MINISEED_FLUSH_INTERVAL_MS = 5000;
 
 // Safety net for unattended field operation: if loop() (or anything it
 // blocks in) doesn't feed this for WATCHDOG_TIMEOUT_S, the ESP32 reboots
@@ -62,7 +61,6 @@ static const unsigned long MINISEED_FLUSH_INTERVAL_MS = 5000;
 static const uint32_t WATCHDOG_TIMEOUT_S = 60;
 
 static unsigned long lastFixCycleMs = 0;
-static unsigned long lastMiniseedFlushMs = 0;
 static unsigned long lastBatteryCheckMs = 0;
 static char lastUploadedDate[9] = "";
 static bool firstFixCycleDone = false;
@@ -88,7 +86,6 @@ static void waitForInitialFix() {
   unsigned long lastGstEnableRetry = 0;
   while (!gnssHasFix() && millis() - start < deviceConfig.fix_timeout_s * 1000UL) {
     esp_task_wdt_reset();
-    pollGeophone();
     pollGNSS();
     // A burst can run 100+s - checkFieldModeTrigger()/sdCheckEjectButton()/
     // sdCheckCardPresence() only being polled once per *outer* loop()
@@ -190,7 +187,6 @@ static void runGnssFixCycle() {
   while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL ||
          (hadInitialFix && millis() - initialFixMs < deviceConfig.ppk_min_duration_s * 1000UL)) {
     esp_task_wdt_reset();
-    pollGeophone();
     pollGNSS();
     // See waitForInitialFix()'s identical comment - this is the longer-
     // running of the two burst loops (typically the ~110s+ one), so it's
@@ -435,7 +431,6 @@ void setup() {
   initBattery();
   initPositionLog();
 
-  initGeophone();
   initMiniseedWriter();
 
   gnssWakeup();
@@ -462,6 +457,12 @@ void setup() {
     runFieldService();
   }
 
+  // Only now, past the field-service check: the geophone task writes
+  // MiniSEED continuously, which must never happen while the card is
+  // exposed to a USB host (runFieldService() reboots on exit, so normal
+  // operation always comes through here).
+  initGeophone();
+
   // Subscribed only for normal operation, after the field-service check
   // above: that console can legitimately sit idle for minutes waiting on a
   // technician's keystrokes, which would otherwise look like a hang and
@@ -477,9 +478,8 @@ void setup() {
 void loop() {
   esp_task_wdt_reset();
 
-  // Highest priority: the geophone digitizer streams continuously and
-  // never pauses, so this must run every iteration.
-  pollGeophone();
+  // The geophone digitizer has its own task now (see geophone.h) - nothing
+  // in this loop can starve it any more.
   pollGNSS();
 
   // Lets a technician trigger field service mode just by plugging in the
@@ -492,14 +492,6 @@ void loop() {
   sdCheckEjectButton();
 
   unsigned long now = millis();
-
-  // The UBX/RTCM capture streams flush themselves on their own timer, on
-  // the SD writer task (see sd_storage.cpp) - miniseedFlush() is the only
-  // one left needing a nudge from here.
-  if (now - lastMiniseedFlushMs >= MINISEED_FLUSH_INTERVAL_MS) {
-    lastMiniseedFlushMs = now;
-    miniseedFlush();
-  }
 
   if (now - lastBatteryCheckMs >= BATTERY_CHECK_INTERVAL_MS) {
     lastBatteryCheckMs = now;

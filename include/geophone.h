@@ -4,23 +4,18 @@
 // Raspberry Shake RS3D digitizer interface - see raspberry_shake.md for the
 // reverse-engineered protocol. Receive-only UART1 at 230400 baud, streaming
 // back-to-back JSON objects (no newline delimiters) at a continuous ~200
-// samples/sec per channel. Must be polled every loop() iteration - the
-// digitizer never pauses, so falling behind risks a UART RX overrun.
-
-void initGeophone();
-void pollGeophone();
-
-// delay() that keeps servicing the geophone UART throughout, for use in any
-// other module's blocking waits (NTRIP/MQTT/modem connect, fix-wait loops)
-// instead of a raw delay() that would starve pollGeophone() for the whole
-// wait. Doesn't help with delays *inside* WalterModem's own blocking AT
-// command calls (mqttConnect/socketDial/httpSend etc.) - those can still
-// cause a brief geophone data gap; the RX buffer is sized with headroom for
-// that, and it's an accepted tradeoff against a full async rewrite.
+// samples/sec per channel.
 //
-// Also feeds the ESP32 task watchdog (see main.cpp) on every call, since
-// it's already the shared choke point for the app's longer blocking waits
-// (modem registration, NTRIP connect) - a single AT command stall inside
-// one of those can still exceed the watchdog timeout on its own, but this
-// keeps the *waiting loop itself* from being mistaken for a hang.
+// initGeophone() starts a dedicated task that drains the UART, parses
+// packets and feeds the MiniSEED writer (including its periodic flush) -
+// nothing else needs to poll it. Call after initMiniseedWriter(), and only
+// once normal operation starts (not in field service mode, where the SD
+// card is exposed over USB and must not be written).
+void initGeophone();
+
+// Watchdog-feeding delay for any other module's blocking waits
+// (NTRIP/MQTT/modem connect, fix-wait loops) - keeps the *waiting loop
+// itself* from being mistaken for a hang by the task watchdog (see
+// main.cpp). The geophone no longer depends on it: its own task keeps
+// running regardless. Name kept from when it also polled the geophone.
 void geophoneAwareDelay(unsigned long ms);

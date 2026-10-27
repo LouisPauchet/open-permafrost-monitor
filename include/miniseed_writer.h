@@ -4,14 +4,18 @@
 // Minimal, from-scratch MiniSEED writer: fixed 512-byte SEED data records,
 // uncompressed 32-bit integer encoding (format code 3) - not Steim1/2. One
 // combined daily file holds interleaved records from all three geophone
-// channels. Every record's start time comes from GNSS UTC (gnss.h) - the
-// digitizer itself has no absolute clock (see raspberry_shake.md SS4).
+// channels. Record start times come from the digitizer's own sample clock,
+// mapped onto GNSS UTC - see geophone_timing.h. Called only from the
+// geophone task (geophone.cpp).
 
 void initMiniseedWriter();
 
-// Called once per decoded sample. channel is "EH1"/"EH2"/"EH3" (the
-// digitizer's CN field, see geophone.h).
-void miniseedAddSample(const char *channel, int32_t sample);
+// Called once per decoded channel packet. channel is "EH1"/"EH2"/"EH3" (the
+// digitizer's CN field), sampleIntervalUs its SI field (0 = assume 200 Hz),
+// roundStartUs the UTC epoch us the digitizer round containing this packet
+// started at (geoClockRoundStartUs()).
+void miniseedAddPacket(const char *channel, const int32_t *samples, size_t n,
+                       uint32_t sampleIntervalUs, int64_t roundStartUs);
 
 // Flushes any partially-filled per-channel record buffers to disk. Call
 // periodically so data isn't held in RAM indefinitely waiting for a

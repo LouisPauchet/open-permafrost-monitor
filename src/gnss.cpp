@@ -158,13 +158,24 @@ static uint8_t lineLen = 0;
 // gnssEpochMillisNow()/gnssCivilNow() below extrapolate off millis() from
 // the last genuinely fresh fix instead, so time keeps advancing correctly
 // even while the F9P is asleep and not reporting at all.
+// Written on loopTask (pollGNSS()), read on the geophone task (MiniSEED
+// timing) - a 64-bit value plus its millis() pair can't be read atomically,
+// so both sides go through anchorMux.
+static portMUX_TYPE anchorMux = portMUX_INITIALIZER_UNLOCKED;
 static uint64_t epochAnchorMs = 0;
 static unsigned long epochAnchorAtMillis = 0;
-static bool haveEpochAnchor = false;
+static volatile bool haveEpochAnchor = false;
 static uint16_t lastAnchoredYear = 0;
 static uint8_t lastAnchoredMonth = 0, lastAnchoredDay = 0, lastAnchoredHour = 0,
                lastAnchoredMinute = 0, lastAnchoredSecond = 0;
 static void maybeUpdateEpochAnchor(); // defined below, after gnssEpochMillis()
+// Only sentences that were read promptly after arriving may anchor the
+// clock: if loopTask was stuck in a blocking call (modem AT command), the
+// backlog is parsed all at once and its time fields describe a moment up to
+// the whole stall ago - anchoring "now" to them would step the clock back,
+// which the MiniSEED timing would then have to re-sync to (and back).
+static const unsigned long ANCHOR_MAX_POLL_GAP_MS = 100;
+static unsigned long lastPollGnssMs = 0;
 
 // Two capture files per GNSS burst (wake-to-sleep cycle, see
 // gnssWakeup()/gnssSleep()) under /data/gnss/, sharing one filename stamp
@@ -448,6 +459,10 @@ void gnssWakeup() {
 }
 
 void pollGNSS() {
+  unsigned long nowMs = millis();
+  bool freshData = nowMs - lastPollGnssMs < ANCHOR_MAX_POLL_GAP_MS;
+  lastPollGnssMs = nowMs;
+
   while (GPSSerial.available() > 0) {
     char c = GPSSerial.read();
     if (DEBUG_PRINT_RAW_GNSS) {
@@ -469,7 +484,9 @@ void pollGNSS() {
     }
   }
 
-  maybeUpdateEpochAnchor();
+  if (freshData) {
+    maybeUpdateEpochAnchor();
+  }
 }
 
 void gnssWriteRTCM(const uint8_t *buf, size_t len) {
@@ -583,9 +600,13 @@ static void maybeUpdateEpochAnchor() {
   lastAnchoredHour = h;
   lastAnchoredMinute = mi;
   lastAnchoredSecond = se;
-  epochAnchorMs = gnssEpochMillis();
-  epochAnchorAtMillis = millis();
+  uint64_t anchorMs = gnssEpochMillis();
+  unsigned long atMillis = millis();
+  portENTER_CRITICAL(&anchorMux);
+  epochAnchorMs = anchorMs;
+  epochAnchorAtMillis = atMillis;
   haveEpochAnchor = true;
+  portEXIT_CRITICAL(&anchorMux);
 }
 
 bool gnssHasEpochAnchor() {
@@ -604,7 +625,11 @@ uint64_t gnssEpochMillisNow() {
   if (!haveEpochAnchor) {
     return 0;
   }
-  return epochAnchorMs + (uint64_t)(millis() - epochAnchorAtMillis);
+  portENTER_CRITICAL(&anchorMux);
+  uint64_t anchorMs = epochAnchorMs;
+  unsigned long atMillis = epochAnchorAtMillis;
+  portEXIT_CRITICAL(&anchorMux);
+  return anchorMs + (uint64_t)(millis() - atMillis);
 }
 
 // Howard Hinnant's civil_from_days algorithm (public domain) - inverse of
@@ -629,7 +654,11 @@ static void civilFromDaysUTC(int64_t z, int *y, unsigned *m, unsigned *d) {
 // caller having to redo the epoch-ms -> civil-date conversion itself.
 void gnssCivilNow(uint16_t *year, uint8_t *month, uint8_t *day, uint8_t *hour, uint8_t *minute,
                    uint8_t *second, uint16_t *milli) {
-  uint64_t ms = gnssEpochMillisNow();
+  gnssCivilFromEpochMillis(gnssEpochMillisNow(), year, month, day, hour, minute, second, milli);
+}
+
+void gnssCivilFromEpochMillis(uint64_t ms, uint16_t *year, uint8_t *month, uint8_t *day,
+                              uint8_t *hour, uint8_t *minute, uint8_t *second, uint16_t *milli) {
   uint64_t totalSecs = ms / 1000ULL;
   *milli = (uint16_t)(ms % 1000ULL);
   int64_t days = (int64_t)(totalSecs / 86400ULL);

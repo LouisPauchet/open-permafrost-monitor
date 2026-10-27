@@ -87,6 +87,10 @@ bool gnssHasEpochAnchor(); // false until the first-ever fix, same as gnssHasDat
 uint64_t gnssEpochMillisNow();
 void gnssCivilNow(uint16_t *year, uint8_t *month, uint8_t *day, uint8_t *hour, uint8_t *minute,
                    uint8_t *second, uint16_t *milli);
+// Same broken-down UTC fields for an arbitrary epoch-ms value (MiniSEED
+// record start times, which come from the sample clock rather than "now").
+void gnssCivilFromEpochMillis(uint64_t ms, uint16_t *year, uint8_t *month, uint8_t *day,
+                              uint8_t *hour, uint8_t *minute, uint8_t *second, uint16_t *milli);
 
 const char *gnssLastGGA(); // raw $..GGA line as last seen from the module, "" if none yet
 uint32_t gnssCharsProcessed();

@@ -1,6 +1,7 @@
 #include "miniseed_writer.h"
 #include "sd_storage.h"
 #include "gnss.h"
+#include "geophone_timing.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -11,23 +12,29 @@ static const char *STATION_NETWORK = "XX";
 static const char *STATION_CODE = "PERM1";
 static const char *LOCATION_CODE = "";
 
-static const int SAMPLE_RATE_HZ = 200; // raw digitizer rate - see raspberry_shake.md
+static const uint32_t DEFAULT_SAMPLE_INTERVAL_US = 5000; // 200 Hz raw digitizer rate - see raspberry_shake.md
 static const int RECORD_LEN = 512;
+// A channel's sample clock is only snapped to the digitizer round's start
+// when they disagree by more than this - 4 samples at 200 Hz. Arrival
+// jitter is already smoothed out by GeoClock, so crossing it means a real
+// discontinuity (lost packet) or accumulated clock drift.
+static const int64_t RESYNC_THRESHOLD_US = 20000;
 static const int SAMPLES_PER_RECORD = 114; // (512 - 48 header - 8 blockette1000) / 4 bytes
 
 struct ChannelBuffer {
   char name[4];
   int32_t samples[SAMPLES_PER_RECORD];
   int count;
-  bool haveStart;
-  uint16_t startYear;
-  uint8_t startMonth, startDay, startHour, startMinute, startSecond;
-  uint16_t startMs;
+  int64_t startUs;      // UTC epoch us of samples[0]
+  uint32_t intervalUs;  // sample interval this record was built at
+  int64_t nextUs;       // where the next packet's first sample is expected
+  bool haveNext;
   uint32_t seq;
 };
 
 static ChannelBuffer channels[3];
 static char dailyDate[9] = "";
+static int64_t dailyDayNumber = -1;
 
 static int dayOfYear(int year, int month, int day) {
   static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
@@ -60,24 +67,27 @@ static ChannelBuffer *findChannel(const char *name) {
   return nullptr;
 }
 
-static void rotateIfNeeded() {
-  // gnssHasEpochAnchor()/gnssCivilNow() (not gnssHasDateTime()/
-  // gnssDateString()) - the latter freeze at the last fix and never expire,
-  // which is exactly what broke continuous recording here (see gnss.h).
-  if (!sdStorageAvailable() || !gnssHasEpochAnchor()) {
+static void rotateIfNeeded(int64_t epochUs) {
+  if (!sdStorageAvailable() || epochUs < 0) {
+    return;
+  }
+  // Cheap integer compare first - this runs once per packet (12/s), and the
+  // civil-date formatting below only once per UTC day.
+  int64_t dayNumber = epochUs / 86400000000LL;
+  if (dayNumber == dailyDayNumber) {
     return;
   }
   uint16_t year, milli;
   uint8_t month, day, hour, minute, second;
-  gnssCivilNow(&year, &month, &day, &hour, &minute, &second, &milli);
+  gnssCivilFromEpochMillis((uint64_t)(epochUs / 1000), &year, &month, &day, &hour, &minute, &second,
+                           &milli);
   char today[9];
   snprintf(today, sizeof(today), "%04u%02u%02u", year, month, day);
-  if (strcmp(today, dailyDate) != 0) {
-    char path[48];
-    sdBuildDailyPath(path, sizeof(path), "data/geophones/geophone", today, "mseed");
-    sdStreamOpen(SD_STREAM_MINISEED, path); // actual open happens on the SD writer task, see sd_storage.h
-    strncpy(dailyDate, today, sizeof(dailyDate) - 1);
-  }
+  char path[48];
+  sdBuildDailyPath(path, sizeof(path), "data/geophones/geophone", today, "mseed");
+  sdStreamOpen(SD_STREAM_MINISEED, path); // actual open happens on the SD writer task, see sd_storage.h
+  strncpy(dailyDate, today, sizeof(dailyDate) - 1);
+  dailyDayNumber = dayNumber;
 }
 
 // Writes one fixed 512-byte MiniSEED data record (SEED v2.4 fixed header +
@@ -110,17 +120,28 @@ static void writeRecord(ChannelBuffer *ch) {
   memcpy(record + 18, STATION_NETWORK, netLen < 2 ? netLen : 2);
 
   // Start time (BTIME, 10 bytes) at offset 20.
-  putU16BE(record + 20, ch->startYear);
-  putU16BE(record + 22, (uint16_t)dayOfYear(ch->startYear, ch->startMonth, ch->startDay));
-  record[24] = ch->startHour;
-  record[25] = ch->startMinute;
-  record[26] = ch->startSecond;
+  uint16_t year, milli;
+  uint8_t month, day, hour, minute, second;
+  gnssCivilFromEpochMillis((uint64_t)(ch->startUs / 1000), &year, &month, &day, &hour, &minute,
+                           &second, &milli);
+  putU16BE(record + 20, year);
+  putU16BE(record + 22, (uint16_t)dayOfYear(year, month, day));
+  record[24] = hour;
+  record[25] = minute;
+  record[26] = second;
   record[27] = 0; // unused
-  putU16BE(record + 28, (uint16_t)(ch->startMs * 10)); // ms -> 0.0001s units
+  putU16BE(record + 28, (uint16_t)((ch->startUs / 100) % 10000)); // 0.0001s units
 
-  putU16BE(record + 30, (uint16_t)ch->count);      // number of samples
-  putU16BE(record + 32, (uint16_t)SAMPLE_RATE_HZ); // sample rate factor (positive = Hz)
-  putU16BE(record + 34, 1);                        // sample rate multiplier
+  // Sample rate as factor/multiplier: positive factor = Hz when it's a whole
+  // number (200 Hz in practice), otherwise negative factor = seconds/sample.
+  putU16BE(record + 30, (uint16_t)ch->count); // number of samples
+  if (ch->intervalUs > 0 && 1000000UL % ch->intervalUs == 0) {
+    putU16BE(record + 32, (uint16_t)(1000000UL / ch->intervalUs));
+    putU16BE(record + 34, 1);
+  } else {
+    putU16BE(record + 32, (uint16_t)(-(int16_t)(ch->intervalUs / 1000))); // -ms per sample
+    putU16BE(record + 34, (uint16_t)(-(int16_t)1000));                     // /1000 -> seconds
+  }
 
   record[36] = 0; // activity flags
   record[37] = 0; // I/O and clock flags
@@ -148,7 +169,6 @@ static void writeRecord(ChannelBuffer *ch) {
 
   ch->seq++;
   ch->count = 0;
-  ch->haveStart = false;
 }
 
 void initMiniseedWriter() {
@@ -157,38 +177,56 @@ void initMiniseedWriter() {
   strncpy(channels[2].name, "EH3", 4);
   for (int i = 0; i < 3; i++) {
     channels[i].count = 0;
-    channels[i].haveStart = false;
+    channels[i].haveNext = false;
+    channels[i].intervalUs = DEFAULT_SAMPLE_INTERVAL_US;
     channels[i].seq = 1;
   }
 }
 
-void miniseedAddSample(const char *channel, int32_t sample) {
-  rotateIfNeeded();
-
+void miniseedAddPacket(const char *channel, const int32_t *samples, size_t n,
+                       uint32_t sampleIntervalUs, int64_t roundStartUs) {
   ChannelBuffer *ch = findChannel(channel);
-  if (!ch) {
+  if (!ch || n == 0) {
     return;
   }
+  uint32_t intervalUs = sampleIntervalUs ? sampleIntervalUs : DEFAULT_SAMPLE_INTERVAL_US;
 
-  if (!ch->haveStart) {
-    if (!gnssHasEpochAnchor()) {
-      return; // no absolute time yet (e.g. before the first GNSS fix) - drop until we have one
-    }
-    gnssCivilNow(&ch->startYear, &ch->startMonth, &ch->startDay, &ch->startHour, &ch->startMinute,
-                 &ch->startSecond, &ch->startMs);
-    ch->haveStart = true;
-  }
-
-  ch->samples[ch->count++] = sample;
-
-  if (ch->count >= SAMPLES_PER_RECORD) {
+  bool hadClock = ch->haveNext;
+  int64_t expectedUs = ch->nextUs;
+  bool resynced = false;
+  int64_t t = geoChannelPacketStartUs(&ch->nextUs, &ch->haveNext, roundStartUs,
+                                      RESYNC_THRESHOLD_US, &resynced);
+  // A record's samples must be contiguous at one rate - close the partial
+  // one rather than let a time step or rate change land inside it.
+  if (ch->count > 0 && (resynced || intervalUs != ch->intervalUs)) {
     writeRecord(ch);
   }
+  if (resynced && hadClock) {
+    // Expected to be rare (a lost packet, or slow digitizer-vs-GNSS clock
+    // drift crossing RESYNC_THRESHOLD_US) - frequent lines here mean
+    // something upstream is dropping data.
+    Serial.printf("MiniSEED: %s time re-synced by %lld us\n", ch->name,
+                  (long long)(roundStartUs - expectedUs));
+  }
+  rotateIfNeeded(t);
+
+  for (size_t i = 0; i < n; i++) {
+    if (ch->count == 0) {
+      ch->startUs = t;
+      ch->intervalUs = intervalUs;
+    }
+    ch->samples[ch->count++] = samples[i];
+    t += intervalUs;
+    if (ch->count >= SAMPLES_PER_RECORD) {
+      writeRecord(ch);
+    }
+  }
+  ch->nextUs = t;
 }
 
 // Moves whatever's currently buffered in RAM (a partial, not-yet-114-sample
 // record) out into the stream, rather than waiting for a full record - so a
-// quiet channel's data still reaches the card within MINISEED_FLUSH_INTERVAL_MS
+// quiet channel's data still reaches the card within geophone.cpp's MINISEED_FLUSH_INTERVAL_MS
 // instead of waiting indefinitely for enough samples to accumulate. Actually
 // reaching the physical card is the SD writer task's own job now (periodic
 // flush, see sd_storage.cpp) - this function no longer needs to trigger
