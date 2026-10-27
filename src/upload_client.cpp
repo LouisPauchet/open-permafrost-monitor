@@ -72,8 +72,8 @@ static void uploadJob(void *) {
 }
 
 bool uploadFileAsync(const char *localPath, const char *remoteFilename) {
-  if (uploadInFlight) {
-    return false;
+  if (uploadInFlight || pendingResult != UPLOAD_NONE) {
+    return false; // the previous result hasn't been taken yet - see uploadTakeResult()
   }
   strncpy(jobLocalPath, localPath, sizeof(jobLocalPath) - 1);
   jobLocalPath[sizeof(jobLocalPath) - 1] = '\0';

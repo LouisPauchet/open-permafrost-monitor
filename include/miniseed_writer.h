@@ -12,10 +12,11 @@ void initMiniseedWriter();
 
 // Called once per decoded channel packet. channel is "EH1"/"EH2"/"EH3" (the
 // digitizer's CN field), sampleIntervalUs its SI field (0 = assume 200 Hz),
-// roundStartUs the UTC epoch us the digitizer round containing this packet
-// started at (geoClockRoundStartUs()).
+// roundMs the digitizer round it belongs to (GeoClock::extMs) and
+// roundStartUs the UTC epoch us that round started at
+// (geoClockRoundStartUs()).
 void miniseedAddPacket(const char *channel, const int32_t *samples, size_t n,
-                       uint32_t sampleIntervalUs, int64_t roundStartUs);
+                       uint32_t sampleIntervalUs, int64_t roundMs, int64_t roundStartUs);
 
 // Flushes any partially-filled per-channel record buffers to disk. Call
 // periodically so data isn't held in RAM indefinitely waiting for a

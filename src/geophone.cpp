@@ -45,7 +45,7 @@ static void handleCompleteObject() {
     return; // no time base yet - drop until the first marker after a GNSS fix
   }
   miniseedAddPacket(packet.channel, packet.samples, packet.count, packet.sampleIntervalUs,
-                    geoClockRoundStartUs(&geoClock));
+                    geoClock.extMs, geoClockRoundStartUs(&geoClock));
 }
 
 static void pollGeophone() {
@@ -114,6 +114,7 @@ void geophoneAwareDelay(unsigned long ms) {
   unsigned long start = millis();
   do {
     esp_task_wdt_reset();
+    pollGNSS(); // keeps PPK UBX flowing to SD through NTRIP/registration waits
     delay(10);
   } while (millis() - start < ms);
 }

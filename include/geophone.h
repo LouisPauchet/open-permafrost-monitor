@@ -17,5 +17,8 @@ void initGeophone();
 // (NTRIP/MQTT/modem connect, fix-wait loops) - keeps the *waiting loop
 // itself* from being mistaken for a hang by the task watchdog (see
 // main.cpp). The geophone no longer depends on it: its own task keeps
-// running regardless. Name kept from when it also polled the geophone.
+// running regardless. It does service the GNSS UART (pollGNSS()), so a long
+// wait mid-burst doesn't overflow it and lose PPK data. loopTask only -
+// pollGNSS() isn't safe to call from two tasks. Name kept from when it
+// polled the geophone.
 void geophoneAwareDelay(unsigned long ms);

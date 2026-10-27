@@ -461,9 +461,14 @@ static volatile bool lastSendFailed = false;
 static volatile bool sendInFlight = false;
 static unsigned long sendStartMs = 0;
 static const unsigned long SEND_ABANDON_MS = 10000;
+// Same generation-tag idea as the receive path: a late callback from an
+// abandoned send must not clear sendInFlight for the newer one.
+static volatile uint32_t sendGeneration = 0;
 
 static void onSocketSendComplete(const WalterModemRsp *rsp, void *args) {
-  sendInFlight = false;
+  if ((uint32_t)(uintptr_t)args == sendGeneration) {
+    sendInFlight = false;
+  }
   if (rsp->result != WALTER_MODEM_STATE_OK) {
     lastSendFailed = true;
     Serial.println(F("Modem: async send failed."));
@@ -511,8 +516,9 @@ bool modemSocketSend(const uint8_t *data, size_t len) {
   static WalterModemRsp sendRsp; // must outlive the async call
   sendInFlight = true;
   sendStartMs = millis();
+  uint32_t myGeneration = ++sendGeneration;
   if (!modem.socketSend(MODEM_SOCKET_ID, sendBuf, (uint16_t)len, WALTER_MODEM_RAI_NO_INFO,
-                        &sendRsp, onSocketSendComplete, nullptr)) {
+                        &sendRsp, onSocketSendComplete, (void *)(uintptr_t)myGeneration)) {
     sendInFlight = false;
     return false;
   }

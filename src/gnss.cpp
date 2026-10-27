@@ -169,7 +169,7 @@ static volatile bool haveEpochAnchor = false;
 static uint16_t lastAnchoredYear = 0;
 static uint8_t lastAnchoredMonth = 0, lastAnchoredDay = 0, lastAnchoredHour = 0,
                lastAnchoredMinute = 0, lastAnchoredSecond = 0;
-static void maybeUpdateEpochAnchor(); // defined below, after gnssEpochMillis()
+static void maybeUpdateEpochAnchor(bool apply); // defined below, after gnssEpochMillis()
 // Only sentences that were read promptly after arriving may anchor the
 // clock: if loopTask was stuck in a blocking call (modem AT command), the
 // backlog is parsed all at once and its time fields describe a moment up to
@@ -513,9 +513,7 @@ void pollGNSS() {
     }
   }
 
-  if (freshData) {
-    maybeUpdateEpochAnchor();
-  }
+  maybeUpdateEpochAnchor(freshData);
 }
 
 void gnssWriteRTCM(const uint8_t *buf, size_t len) {
@@ -626,7 +624,25 @@ uint64_t gnssEpochMillis() {
 // to report at all) would just keep resetting epochAnchorAtMillis against
 // the same stale fields, which cancels out the millis() extrapolation this
 // exists to provide in the first place.
-static void maybeUpdateEpochAnchor() {
+//
+// A new second is always "used up" here, even when apply is false (the
+// sentence came out of a backlog, see ANCHOR_MAX_POLL_GAP_MS) - otherwise
+// the next, prompt poll would see that same stale second as new and anchor
+// to it after all.
+//
+// Arrival latency: NMEA shares the 38400 baud link with RAWX/SFRBX and is
+// queued behind them, so a sentence reaches us anywhere from tens to
+// hundreds of ms after the epoch it describes, varying second to second.
+// The latency can only ever make a sentence late, never early, so the best
+// estimate is the one with the least latency: keep the anchor that puts
+// "now" latest, letting a later sentence pull it back only by the most the
+// ESP32's crystal can have drifted since (ANCHOR_DRIFT_PPM). A
+// disagreement beyond ANCHOR_RESET_MS is a real clock change (first fix,
+// bad earlier time) and is taken as-is.
+static const int64_t ANCHOR_RESET_MS = 2000;
+static const int64_t ANCHOR_DRIFT_PPM = 50;
+
+static void maybeUpdateEpochAnchor(bool apply) {
   if (!gnssHasDateTime()) {
     return;
   }
@@ -642,10 +658,23 @@ static void maybeUpdateEpochAnchor() {
   lastAnchoredHour = h;
   lastAnchoredMinute = mi;
   lastAnchoredSecond = se;
-  uint64_t anchorMs = gnssEpochMillis();
+  if (!apply) {
+    return;
+  }
+  int64_t sentenceMs = (int64_t)gnssEpochMillis();
   unsigned long atMillis = millis();
   portENTER_CRITICAL(&anchorMux);
-  epochAnchorMs = anchorMs;
+  int64_t anchorMs = sentenceMs;
+  if (haveEpochAnchor) {
+    unsigned long elapsed = atMillis - epochAnchorAtMillis;
+    int64_t predictedMs = (int64_t)epochAnchorMs + (int64_t)elapsed;
+    int64_t diff = sentenceMs - predictedMs;
+    if (diff < 0 && diff >= -ANCHOR_RESET_MS) {
+      int64_t floorMs = predictedMs - ((int64_t)elapsed * ANCHOR_DRIFT_PPM) / 1000000 - 1;
+      anchorMs = sentenceMs > floorMs ? sentenceMs : floorMs;
+    }
+  }
+  epochAnchorMs = (uint64_t)anchorMs;
   epochAnchorAtMillis = atMillis;
   haveEpochAnchor = true;
   portEXIT_CRITICAL(&anchorMux);

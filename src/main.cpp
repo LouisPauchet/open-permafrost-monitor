@@ -236,6 +236,19 @@ static void handleUploadResult() {
   }
 }
 
+// Picks up finished modem jobs' results. Must run before new jobs are
+// staged, not only from loop(): back-to-back bursts (commissioning) start
+// the next burst in the very next loop() iteration, and staging first used
+// to (a) mark the *new* batch's rows as sent on the old batch's success,
+// losing them if the new one then failed, and (b) re-queue the same day's
+// upload every burst because its OK result was overwritten unread.
+static void consumeModemJobResults() {
+  if (mqttLastBatchOk()) {
+    positionLogMarkSent();
+  }
+  handleUploadResult();
+}
+
 static void runGnssFixCycle() {
   gnssWakeup();
   geophoneAwareDelay(500);
@@ -427,10 +440,10 @@ static void runGnssFixCycle() {
     // only ever seeing "cycle cut short, no data."
     if (millis() - lastStatusPrint >= 10000) {
       lastStatusPrint = millis();
-      Serial.printf("[STATUS] t=%lus fix=%s hAcc=%.3fm RTCM=%uB SDdrop=%luB\n",
+      Serial.printf("[STATUS] t=%lus fix=%s hAcc=%.3fm RTCM=%uB SDdrop=%luB heap=%luB\n",
                     (millis() - fixWaitStart) / 1000, gnssFixQualityLabel(gnssFixQuality()),
                     gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f, ntripBytesForwarded(),
-                    (unsigned long)sdStreamDroppedBytes());
+                    (unsigned long)sdStreamDroppedBytes(), (unsigned long)ESP.getFreeHeap());
     }
 
     delay(20);
@@ -472,6 +485,7 @@ static void runGnssFixCycle() {
   ntripDisconnect();
   // Both piggyback on the modem session this cycle already opened for NTRIP,
   // and both only queue work on the modem worker task (see modem.h).
+  consumeModemJobResults();
   runTelemetryBatch();
   startDailyUploadIfDue();
   // Can't call modemSleep() here directly - the jobs queued above are
@@ -611,15 +625,10 @@ void loop() {
     runGnssFixCycle();
   }
 
-  // Cheap consuming check every iteration - true only once, right when an
-  // async batch kicked off by runTelemetryBatch() (see above) actually
-  // completes, which can be several loop() iterations after that call
-  // returned (see modem.cpp).
-  if (mqttLastBatchOk()) {
-    positionLogMarkSent();
-  }
-
-  handleUploadResult();
+  // Cheap consuming check every iteration - results arrive whenever the
+  // modem worker finishes, several loop() iterations after the jobs were
+  // queued (see modem.cpp).
+  consumeModemJobResults();
 
   // Deferred from runGnssFixCycle()'s end - only safe to cut radio once the
   // modem jobs that cycle queued (MQTT batch, daily upload) have actually

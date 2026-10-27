@@ -29,6 +29,7 @@ struct ChannelBuffer {
   uint32_t intervalUs;  // sample interval this record was built at
   int64_t nextUs;       // where the next packet's first sample is expected
   bool haveNext;
+  int64_t lastRoundMs;  // digitizer round (marker MSEC) this channel last stamped from
   uint32_t seq;
 };
 
@@ -132,15 +133,18 @@ static void writeRecord(ChannelBuffer *ch) {
   record[27] = 0; // unused
   putU16BE(record + 28, (uint16_t)((ch->startUs / 100) % 10000)); // 0.0001s units
 
-  // Sample rate as factor/multiplier: positive factor = Hz when it's a whole
-  // number (200 Hz in practice), otherwise negative factor = seconds/sample.
+  // Sample rate as factor/multiplier: factor = Hz with multiplier 1 when
+  // that's a whole number (200 Hz in practice); otherwise factor 1000 with
+  // a negative multiplier (= divide) of the interval in ms, i.e.
+  // 1000/ms Hz - exact for any whole-ms interval.
   putU16BE(record + 30, (uint16_t)ch->count); // number of samples
   if (ch->intervalUs > 0 && 1000000UL % ch->intervalUs == 0) {
     putU16BE(record + 32, (uint16_t)(1000000UL / ch->intervalUs));
     putU16BE(record + 34, 1);
   } else {
-    putU16BE(record + 32, (uint16_t)(-(int16_t)(ch->intervalUs / 1000))); // -ms per sample
-    putU16BE(record + 34, (uint16_t)(-(int16_t)1000));                     // /1000 -> seconds
+    uint32_t intervalMs = ch->intervalUs / 1000 ? ch->intervalUs / 1000 : 1;
+    putU16BE(record + 32, 1000);
+    putU16BE(record + 34, (uint16_t)(-(int16_t)intervalMs));
   }
 
   record[36] = 0; // activity flags
@@ -184,11 +188,19 @@ void initMiniseedWriter() {
 }
 
 void miniseedAddPacket(const char *channel, const int32_t *samples, size_t n,
-                       uint32_t sampleIntervalUs, int64_t roundStartUs) {
+                       uint32_t sampleIntervalUs, int64_t roundMs, int64_t roundStartUs) {
   ChannelBuffer *ch = findChannel(channel);
   if (!ch || n == 0) {
     return;
   }
+  // A second packet for this channel within the same round means the
+  // marker in between was lost (corrupt object dropped) - roundStartUs is
+  // then the *previous* round's start, 250 ms behind. Trust the channel's
+  // own continuous clock instead of snapping back to it.
+  if (ch->haveNext && roundMs == ch->lastRoundMs) {
+    roundStartUs = ch->nextUs;
+  }
+  ch->lastRoundMs = roundMs;
   uint32_t intervalUs = sampleIntervalUs ? sampleIntervalUs : DEFAULT_SAMPLE_INTERVAL_US;
 
   bool hadClock = ch->haveNext;
