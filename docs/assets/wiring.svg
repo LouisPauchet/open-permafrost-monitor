@@ -1,0 +1,223 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1260 900" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="13">
+  <title>Open Permafrost Monitor - wiring diagram</title>
+  <defs>
+    <marker id="a-gnss" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#2e7d32"/></marker>
+    <marker id="a-geo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#7b1fa2"/></marker>
+    <marker id="a-sd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1565c0"/></marker>
+    <marker id="a-adc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6d4c41"/></marker>
+    <!-- ground symbol, origin at the connection point -->
+    <g id="gnd" stroke="#212121" stroke-width="2.5" fill="none">
+      <path d="M0,0 V12 M-12,12 H12 M-8,17 H8 M-4,22 H4"/>
+    </g>
+    <style>
+      .box { fill: #f7f9fb; stroke: #37474f; stroke-width: 2; }
+      .walter { fill: #eef3f8; stroke: #263238; stroke-width: 2.5; }
+      .title { font-weight: 700; font-size: 14px; fill: #1b1b1b; }
+      .sub { font-size: 12px; fill: #546e7a; }
+      .pin { fill: #263238; font-size: 12.5px; }
+      .warn { fill: #c62828; font-size: 12.5px; font-weight: 600; }
+      .pad { fill: #ffffff; stroke: #263238; stroke-width: 1.5; }
+      .w { fill: none; stroke-width: 2.6; stroke-linejoin: round; }
+      .v5 { stroke: #d32f2f; } .v12 { stroke: #ef6c00; } .v33 { stroke: #ad1457; }
+      .gndw { stroke: #212121; } .gnss { stroke: #2e7d32; } .geo { stroke: #7b1fa2; }
+      .sd { stroke: #1565c0; } .ctl { stroke: #00838f; } .adc { stroke: #6d4c41; }
+      .dot { stroke: none; }
+    </style>
+  </defs>
+
+  <!-- Opaque background so the drawing reads the same in light and dark themes -->
+  <rect x="0" y="0" width="1260" height="900" rx="12" fill="#ffffff"/>
+
+  <!-- ===================== WALTER ===================== -->
+  <rect class="walter" x="500" y="80" width="320" height="720" rx="10"/>
+  <text class="title" x="660" y="104" text-anchor="middle">Walter ESP32-S3</text>
+  <text class="sub" x="660" y="121" text-anchor="middle">GM02SP LTE-M modem · SIM · LTE antenna</text>
+  <text class="sub" x="660" y="786" text-anchor="middle">USB-C: flashing · console · SD drive</text>
+  <!-- left pins -->
+  <g class="pin">
+    <rect class="pad" x="494" y="134" width="12" height="12"/><text x="512" y="144">5V in</text>
+    <rect class="pad" x="494" y="174" width="12" height="12"/><text x="512" y="184">GND</text>
+    <rect class="pad" x="494" y="254" width="12" height="12"/><text x="512" y="264">GPIO 16 · UART2 RX</text>
+    <rect class="pad" x="494" y="294" width="12" height="12"/><text x="512" y="304">GPIO 17 · UART2 TX</text>
+    <rect class="pad" x="494" y="334" width="12" height="12"/><text x="512" y="344">GPIO 18 · EXTINT</text>
+    <rect class="pad" x="494" y="474" width="12" height="12"/><text x="512" y="484">GPIO 15 · UART1 RX</text>
+  </g>
+  <g transform="translate(80,0)">
+  <!-- right pins -->
+  <g class="pin" text-anchor="end">
+    <rect class="pad" x="734" y="134" width="12" height="12"/><text x="728" y="144">GPIO 12 · SCK</text>
+    <rect class="pad" x="734" y="174" width="12" height="12"/><text x="728" y="184">GPIO 11 · MOSI</text>
+    <rect class="pad" x="734" y="214" width="12" height="12"/><text x="728" y="224">GPIO 13 · MISO</text>
+    <rect class="pad" x="734" y="254" width="12" height="12"/><text x="728" y="264">GPIO 38 · CS</text>
+    <rect class="pad" x="734" y="294" width="12" height="12"/><text x="728" y="304">GPIO 39 · card detect</text>
+    <rect class="pad" x="734" y="334" width="12" height="12"/><text x="728" y="344">3V3 switched (EN = GPIO 0)</text>
+    <rect class="pad" x="734" y="374" width="12" height="12"/><text x="728" y="384">GND</text>
+    <rect class="pad" x="734" y="454" width="12" height="12"/><text x="728" y="464">GPIO 41</text>
+    <rect class="pad" x="734" y="534" width="12" height="12"/><text x="728" y="544">GPIO 40</text>
+    <rect class="pad" x="734" y="634" width="12" height="12"/><text x="728" y="644">GPIO 2 · ADC</text>
+    <rect class="pad" x="734" y="734" width="12" height="12"/><text x="728" y="744">GPIO 1 · ADC</text>
+  </g>
+
+  </g>
+  <!-- ===================== ZED-F9P ===================== -->
+  <text class="title" x="240" y="192" text-anchor="middle">u-blox ZED-F9P (ELT0128)</text>
+  <rect class="box" x="150" y="200" width="180" height="180" rx="6"/>
+  <g class="pin">
+    <rect class="pad" x="144" y="224" width="12" height="12"/><text x="162" y="234">VCC</text>
+    <rect class="pad" x="144" y="344" width="12" height="12"/><text x="162" y="354">GND</text>
+  </g>
+  <g class="pin" text-anchor="end">
+    <rect class="pad" x="324" y="254" width="12" height="12"/><text x="318" y="264">UART1 TXO</text>
+    <rect class="pad" x="324" y="294" width="12" height="12"/><text x="318" y="304">UART1 RXI</text>
+    <rect class="pad" x="324" y="334" width="12" height="12"/><text x="318" y="344">EXTINT</text>
+  </g>
+  <text class="sub" x="268" y="220" text-anchor="middle">SMA → GNSS antenna</text>
+  <text class="warn" x="240" y="400" text-anchor="middle">⚠ SEL jumper must be OPEN (UART mode)</text>
+
+  <!-- ===================== RS3D ===================== -->
+  <text class="title" x="240" y="432" text-anchor="middle">RS3D digitizer (Pi header)</text>
+  <rect class="box" x="150" y="440" width="180" height="110" rx="6"/>
+  <g class="pin">
+    <rect class="pad" x="144" y="459" width="12" height="12"/><text x="162" y="469">pin 2 · 5V</text>
+    <rect class="pad" x="144" y="519" width="12" height="12"/><text x="162" y="529">pin 6 · GND</text>
+  </g>
+  <g class="pin" text-anchor="end">
+    <rect class="pad" x="324" y="474" width="12" height="12"/><text x="318" y="484">pin 10 · data out</text>
+  </g>
+  <text class="sub" x="240" y="568" text-anchor="middle">pin 8 (Pi TXD): not connected</text>
+
+  <!-- ===================== POWER ===================== -->
+  <rect class="box" x="20" y="760" width="110" height="90" rx="6"/>
+  <text class="title" x="70" y="800" text-anchor="middle">12 V</text>
+  <text class="sub" x="70" y="817" text-anchor="middle">battery</text>
+  <text class="pin" x="120" y="785" text-anchor="end" font-weight="700">+</text>
+  <text class="pin" x="120" y="835" text-anchor="end" font-weight="700">−</text>
+
+  <!-- fuse -->
+  <path class="w v12" d="M130,780 H160"/>
+  <rect x="160" y="772" width="50" height="16" rx="3" fill="#fff3e0" stroke="#ef6c00" stroke-width="2"/>
+  <path d="M164,780 H206" stroke="#ef6c00" stroke-width="1.5"/>
+  <text class="pin" x="185" y="766" text-anchor="middle">fuse</text>
+  <path class="w v12" d="M210,780 H260"/>
+  <circle class="dot" cx="235" cy="780" r="4.5" fill="#ef6c00"/>
+  <path class="w v12" d="M235,780 V752"/>
+  <path d="M220,752 H250 L256,744 L250,736 H220 Z" fill="#fff3e0" stroke="#ef6c00" stroke-width="1.8"/>
+  <text x="236" y="748" text-anchor="middle" font-size="10.5" font-weight="700" fill="#e65100">BATT+</text>
+
+  <!-- Pololu regulator -->
+  <rect class="box" x="260" y="740" width="200" height="110" rx="6"/>
+  <text class="title" x="372" y="795" text-anchor="middle">Pololu step-down</text>
+  <text class="sub" x="372" y="812" text-anchor="middle">5 V · 5 A</text>
+  <g class="pin">
+    <rect class="pad" x="254" y="774" width="12" height="12"/><text x="271" y="784">VIN</text>
+    <rect class="pad" x="254" y="824" width="12" height="12"/><text x="271" y="834">GND</text>
+    <rect class="pad" x="294" y="734" width="12" height="12"/><text x="300" y="762" text-anchor="middle">VOUT</text>
+  </g>
+  <!-- battery minus / regulator ground -->
+  <path class="w gndw" d="M130,830 H260"/>
+  <circle class="dot" cx="195" cy="830" r="4.5" fill="#212121"/>
+  <use href="#gnd" x="195" y="830"/>
+
+  <!-- 5 V rail -->
+  <path class="w v5" d="M300,734 V720 H100 V110 H470 V140 H494"/>
+  <circle class="dot" cx="100" cy="230" r="4.5" fill="#d32f2f"/>
+  <path class="w v5" d="M100,230 H144"/>
+  <circle class="dot" cx="100" cy="465" r="4.5" fill="#d32f2f"/>
+  <path class="w v5" d="M100,465 H144"/>
+  <text x="88" y="600" fill="#d32f2f" font-weight="700" font-size="12.5" transform="rotate(-90 88 600)" text-anchor="middle">5 V rail</text>
+
+  <!-- grounds on the left -->
+  <path class="w gndw" d="M144,350 H124"/><use href="#gnd" x="124" y="350"/>
+  <path class="w gndw" d="M144,525 H124"/><use href="#gnd" x="124" y="525"/>
+  <path class="w gndw" d="M494,180 H478"/><use href="#gnd" x="478" y="180"/>
+
+  <!-- GNSS UART + EXTINT -->
+  <path class="w gnss" d="M336,260 H492" marker-end="url(#a-gnss)"/>
+  <path class="w gnss" d="M494,300 H338" marker-end="url(#a-gnss)"/>
+  <path class="w gnss" d="M494,340 H338" marker-end="url(#a-gnss)"/>
+  <text class="sub" x="415" y="253" text-anchor="middle">NMEA + UBX</text>
+  <text class="sub" x="415" y="293" text-anchor="middle">RTCM + config</text>
+  <text class="sub" x="415" y="333" text-anchor="middle">wake pulse</text>
+  <text class="sub" x="415" y="375" text-anchor="middle">38400 baud</text>
+
+  <!-- Geophone UART -->
+  <path class="w geo" d="M336,480 H492" marker-end="url(#a-geo)"/>
+  <text class="sub" x="415" y="473" text-anchor="middle">JSON samples</text>
+  <text class="sub" x="415" y="500" text-anchor="middle">230400 baud</text>
+
+  <g transform="translate(80,0)">
+  <!-- ===================== SD BREAKOUT ===================== -->
+  <text class="title" x="980" y="100" text-anchor="middle">microSD breakout (SPI)</text>
+  <rect class="box" x="880" y="110" width="200" height="300" rx="6"/>
+  <g class="pin">
+    <rect class="pad" x="874" y="134" width="12" height="12"/><text x="892" y="144">SCK</text>
+    <rect class="pad" x="874" y="174" width="12" height="12"/><text x="892" y="184">MOSI / DI</text>
+    <rect class="pad" x="874" y="214" width="12" height="12"/><text x="892" y="224">MISO / DO</text>
+    <rect class="pad" x="874" y="254" width="12" height="12"/><text x="892" y="264">CS</text>
+    <rect class="pad" x="874" y="294" width="12" height="12"/><text x="892" y="304">CD (card detect)</text>
+    <rect class="pad" x="874" y="334" width="12" height="12"/><text x="892" y="344">VCC 3.3 V</text>
+    <rect class="pad" x="874" y="374" width="12" height="12"/><text x="892" y="384">GND</text>
+  </g>
+  <text class="sub" x="980" y="426" text-anchor="middle">no CD switch? tie GPIO 39 HIGH</text>
+  <path class="w sd" d="M746,140 H872" marker-end="url(#a-sd)"/>
+  <path class="w sd" d="M746,180 H872" marker-end="url(#a-sd)"/>
+  <path class="w sd" d="M874,220 H748" marker-end="url(#a-sd)"/>
+  <path class="w sd" d="M746,260 H872" marker-end="url(#a-sd)"/>
+  <path class="w sd" d="M874,300 H748" marker-end="url(#a-sd)"/>
+  <path class="w v33" d="M746,340 H874"/>
+  <path class="w gndw" d="M746,380 H874"/>
+  <text class="sub" x="810" y="402" text-anchor="middle">SPI · 4 MHz</text>
+
+  <!-- ===================== EJECT BUTTON ===================== -->
+  <text class="pin" x="756" y="452" font-weight="600">SD eject button (momentary)</text>
+  <path class="w ctl" d="M746,460 H990"/>
+  <circle cx="994" cy="460" r="4" fill="#fff" stroke="#00838f" stroke-width="2"/>
+  <circle cx="1046" cy="460" r="4" fill="#fff" stroke="#00838f" stroke-width="2"/>
+  <path d="M988,448 H1052 M1020,448 V438 M1012,438 H1028" stroke="#00838f" stroke-width="2.4" fill="none"/>
+  <path class="w gndw" d="M1050,460 H1090"/><use href="#gnd" x="1090" y="460"/>
+
+  <!-- ===================== SERVICE JUMPER ===================== -->
+  <text class="pin" x="756" y="532" font-weight="600">Field-service jumper / cable</text>
+  <path class="w ctl" d="M746,540 H986"/>
+  <rect x="986" y="532" width="48" height="16" rx="3" fill="#e0f2f1" stroke="#00838f" stroke-width="2"/>
+  <circle cx="998" cy="540" r="3.5" fill="#00838f"/><circle cx="1022" cy="540" r="3.5" fill="#00838f"/>
+  <path class="w gndw" d="M1034,540 H1090"/><use href="#gnd" x="1090" y="540"/>
+  <text class="sub" x="756" y="558">closed = service menu</text>
+
+  <!-- ===================== BATTERY DIVIDER ===================== -->
+  <path class="w adc" d="M900,640 H748" marker-end="url(#a-adc)"/>
+  <circle class="dot" cx="900" cy="640" r="4.5" fill="#6d4c41"/>
+  <path class="w v12" d="M900,640 V625"/>
+  <rect x="892" y="585" width="16" height="40" fill="#fff" stroke="#6d4c41" stroke-width="2"/>
+  <path class="w v12" d="M900,585 V574"/>
+  <path d="M878,574 H922 V558 H878 Z" fill="#fff3e0" stroke="#ef6c00" stroke-width="1.8"/>
+  <text x="900" y="570" text-anchor="middle" font-size="10.5" font-weight="700" fill="#e65100">BATT+</text>
+  <path class="w gndw" d="M900,640 V655"/>
+  <rect x="892" y="655" width="16" height="40" fill="#fff" stroke="#6d4c41" stroke-width="2"/>
+  <path class="w gndw" d="M900,695 V705"/><use href="#gnd" x="900" y="705"/>
+  <text class="pin" x="918" y="610">R1</text>
+  <text class="pin" x="918" y="680">R2</text>
+  <text class="pin" x="950" y="636" font-weight="600">External battery sense</text>
+  <text class="sub" x="950" y="653">(R1+R2)/R2 = 6.4545</text>
+  <text class="sub" x="950" y="669">ADC full scale ≈ 3.1 V at the pin</text>
+
+  <path class="w adc" d="M880,740 H748" marker-end="url(#a-adc)"/>
+  <text class="sub" x="888" y="736">internal (Walter) battery</text>
+  <text class="sub" x="888" y="751">divider, ratio 2.0 (uncalibrated)</text>
+
+  </g>
+  <!-- ===================== LEGEND ===================== -->
+  <rect x="640" y="820" width="600" height="68" rx="6" fill="#fafafa" stroke="#cfd8dc"/>
+  <g font-size="12" fill="#263238" transform="translate(80,0)">
+    <path class="w v12" d="M574,838 H600"/><text x="606" y="842">12 V battery</text>
+    <path class="w v5" d="M700,838 H726"/><text x="732" y="842">5 V rail</text>
+    <path class="w v33" d="M808,838 H834"/><text x="840" y="842">3.3 V switched</text>
+    <path class="w gndw" d="M944,838 H970"/><text x="976" y="842">GND (all common)</text>
+    <path class="w gnss" d="M574,862 H600"/><text x="606" y="866">GNSS</text>
+    <path class="w geo" d="M660,862 H686"/><text x="692" y="866">geophone</text>
+    <path class="w sd" d="M768,862 H794"/><text x="800" y="866">SD (SPI)</text>
+    <path class="w ctl" d="M868,862 H894"/><text x="900" y="866">inputs</text>
+    <path class="w adc" d="M958,862 H984"/><text x="990" y="866">ADC</text>
+    <text x="574" y="882" fill="#546e7a">Arrows = signal direction · all signals 3.3 V logic · dots = joined wires</text>
+  </g>
+</svg>
