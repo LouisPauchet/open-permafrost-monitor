@@ -14,6 +14,13 @@
 bool sdStorageInit();
 bool sdStorageAvailable();
 
+// Free space on the card in MB, refreshed every minute; -1 if unknown or no
+// card. sdStorageLowSpace() is true below the floor (1 GB) at which the
+// geophone MiniSEED stream stops being written so the small positions CSV
+// and GNSS raw files can carry on.
+int32_t sdStorageFreeMb();
+bool sdStorageLowSpace();
+
 // Polls SD_CARD_DETECT_PIN (debounced) - reboots to cleanly mount a newly
 // (re)inserted card, or marks storage unavailable the moment one is pulled
 // rather than waiting for the next write to fail. A card that's present but

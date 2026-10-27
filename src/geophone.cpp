@@ -81,7 +81,11 @@ static void pollGeophone() {
 // digitizer's ~6-8 KB/s, so any longer stall silently lost samples. On its
 // own task nothing loopTask does can starve it.
 static const uint32_t GEOPHONE_POLL_MS = 10;
-static const uint32_t MINISEED_FLUSH_INTERVAL_MS = 5000;
+// Full MiniSEED records are queued the moment they fill (every ~0.6 s
+// uncompressed, a few seconds with Steim2) - this only bounds how long a
+// *partial* record can sit in RAM. Each flush cuts a partially filled
+// record per channel, which costs Steim2 density, so it's not shorter.
+static const uint32_t MINISEED_FLUSH_INTERVAL_MS = 30000;
 
 static void geophoneTaskFn(void *) {
   uint32_t lastFlushMs = millis();
@@ -107,7 +111,7 @@ void initGeophone() {
   // Core 0 with the SD writer (priority 1) and modem worker (priority 1) -
   // above both so a long SD write or AT exchange can't delay draining.
   // Core 1 carries loopTask and WalterModem's own tasks.
-  xTaskCreatePinnedToCore(geophoneTaskFn, "geophoneTask", 4096, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(geophoneTaskFn, "geophoneTask", 6144, NULL, 2, NULL, 0);
 }
 
 void geophoneAwareDelay(unsigned long ms) {

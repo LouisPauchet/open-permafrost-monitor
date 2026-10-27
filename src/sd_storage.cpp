@@ -61,6 +61,35 @@ void sdReaderEnd() {
   activeReaders--;
 }
 
+// --- Free space ---
+//
+// Measured by whoever owns the card at the time: once at boot (before any
+// stream is open - FatFs may have to scan the FAT the very first time, which
+// on a large card can take a while), then by the writer task every
+// FREE_SPACE_REFRESH_MS, where FatFs's cached free-cluster count makes it
+// cheap. Uncompressed MiniSEED alone is ~230 MB/day, so a card fills in
+// months; below GEOPHONE_MIN_FREE_BYTES the geophone stops being written
+// (see miniseed_writer.cpp) so the much smaller positions CSV and GNSS raw
+// files keep going for weeks more.
+static const uint64_t GEOPHONE_MIN_FREE_BYTES = 1024ULL * 1024ULL * 1024ULL;
+static const unsigned long FREE_SPACE_REFRESH_MS = 60000;
+static volatile int32_t freeMb = -1; // -1 = unknown
+
+static void measureFreeSpace() {
+  uint64_t total = SD.totalBytes();
+  uint64_t used = SD.usedBytes();
+  freeMb = total >= used ? (int32_t)((total - used) / (1024ULL * 1024ULL)) : 0;
+}
+
+int32_t sdStorageFreeMb() {
+  return available ? freeMb : -1;
+}
+
+bool sdStorageLowSpace() {
+  int32_t mb = freeMb;
+  return mb >= 0 && (uint64_t)mb * 1024ULL * 1024ULL < GEOPHONE_MIN_FREE_BYTES;
+}
+
 bool sdStorageInit() {
   pinMode(SD_POWER_EN_PIN, OUTPUT);
   digitalWrite(SD_POWER_EN_PIN, LOW); // active LOW enable; held on continuously -
@@ -98,6 +127,9 @@ bool sdStorageInit() {
   SD.mkdir("/data");
   SD.mkdir("/data/gnss");
   SD.mkdir("/data/geophones");
+
+  measureFreeSpace();
+  Serial.printf("SD: %ld MB free\n", (long)freeMb);
 
   return true;
 }
@@ -309,6 +341,7 @@ TaskHandle_t g_writerTask = nullptr;
 void sdWriterTaskFn(void *) {
   const TickType_t drainPeriod = pdMS_TO_TICKS(50);
   unsigned long lastFlushMs = 0;
+  unsigned long lastFreeSpaceMs = millis();
   uint8_t local[sizeof(StreamRing::buf)]; // task-owned scratch, not on the stack per-iteration
 
   for (;;) {
@@ -390,6 +423,11 @@ void sdWriterTaskFn(void *) {
     // shrinks the exposure window for the continuous high-rate UBX/RTCM/
     // MiniSEED streams (positions CSV already flushes every row, see
     // position_log.cpp).
+    if (available && millis() - lastFreeSpaceMs >= FREE_SPACE_REFRESH_MS) {
+      lastFreeSpaceMs = millis();
+      measureFreeSpace();
+    }
+
     if (millis() - lastFlushMs >= 2000) {
       lastFlushMs = millis();
       for (int s = 0; s < SD_STREAM_COUNT; s++) {

@@ -14,7 +14,7 @@ static size_t pendingOffset = 0; // file size as of the last positionLogReadUnse
 
 static const char *CSV_HEADER = "time,latitude,longitude,altitude,horizontal_accuracy,"
                                  "vertical_accuracy,fix_quality,quality_ok,battery_external_v,"
-                                 "battery_internal_v,has_displacement,north_m,east_m,up_m,epoch_ms";
+                                 "battery_internal_v,has_displacement,north_m,east_m,up_m,epoch_ms,sd_free_mb";
 
 // Row time and the daily file's date both come from gnssEpochMillisNow()
 // (extrapolated from the last fresh fix), not TinyGPS++'s date/time fields:
@@ -99,14 +99,14 @@ void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInte
   bool fix = gnssHasFix();
   char row[256];
   int len = snprintf(
-      row, sizeof(row), "%s,%.8f,%.8f,%.2f,%.3f,%.3f,%d,%s,%.2f,%.2f,%s,%.4f,%.4f,%.4f,%llu\n", ts,
+      row, sizeof(row), "%s,%.8f,%.8f,%.2f,%.3f,%.3f,%d,%s,%.2f,%.2f,%s,%.4f,%.4f,%.4f,%llu,%ld\n", ts,
       fix ? gnssLatitude() : 0.0, fix ? gnssLongitude() : 0.0, fix ? gnssAltitude() : 0.0,
       gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f,
       gnssHasAccuracyEstimate() ? gnssVerticalAccuracy() : -1.0f, gnssFixQuality(),
       qualityOk ? "true" : "false", batteryExternalV, batteryInternalV,
       hasDisplacement ? "true" : "false", hasDisplacement ? northM : 0.0f,
       hasDisplacement ? eastM : 0.0f, hasDisplacement ? upM : 0.0f,
-      (unsigned long long)epochMs);
+      (unsigned long long)epochMs, (long)sdStorageFreeMb());
   if (len <= 0) {
     return;
   }
@@ -164,7 +164,10 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
   while (f.available() && count < MAX_ROWS) {
     String line = f.readStringUntil('\n');
     size_t posAfterLine = f.position();
-    if (line.length() == 0) {
+    // The header row has as many fields as a data row, so the field-count
+    // check below never caught it: it used to go out as a junk row with
+    // ts 0 (1970) at the start of every daily file.
+    if (line.length() == 0 || line.startsWith("time,")) {
       lastGoodPos = posAfterLine;
       continue;
     }
@@ -173,10 +176,12 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
     strncpy(lineBuf, line.c_str(), sizeof(lineBuf) - 1);
     lineBuf[sizeof(lineBuf) - 1] = '\0';
 
-    char *field[15];
+    // 16 fields since sd_free_mb was added; 15 on rows written by older
+    // firmware earlier the same day (same file, older header).
+    char *field[16];
     int n = 0;
     char *tok = strtok(lineBuf, ",");
-    while (tok != nullptr && n < 15) {
+    while (tok != nullptr && n < 16) {
       field[n++] = tok;
       tok = strtok(nullptr, ",");
     }
@@ -229,6 +234,12 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
     // directional components.
     values["horizontal_displacement_m"] =
         hasDisplacement ? sqrtf(northM * northM + eastM * eastM) : 0.0f;
+    if (n >= 16) {
+      long freeMb = atol(field[15]);
+      if (freeMb >= 0) { // -1 = unknown (no card measured)
+        values["sd_free_mb"] = freeMb;
+      }
+    }
 
     // Stop before this row would overflow the caller's buffer - publish the
     // valid, complete batch built so far now rather than a truncated one;

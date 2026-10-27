@@ -69,6 +69,7 @@ static void printMenu() {
   Serial.println(F("D) Set low-battery cutoff (V) - new bursts skipped below this"));
   Serial.println(F("E) Set NTRIP on every Nth burst (1 = every burst)"));
   Serial.println(F("F) Set MiniSEED network/station/location codes"));
+  Serial.println(F("G) Toggle MiniSEED Steim2 compression"));
   Serial.println(F("0) Save and exit"));
   Serial.print(F("> "));
 }
@@ -83,6 +84,8 @@ static void showConfig() {
   Serial.printf("MiniSEED codes: network=%s station=%s location=%s\n", deviceConfig.seed_network,
                 deviceConfig.seed_station,
                 deviceConfig.seed_location[0] ? deviceConfig.seed_location : "(blank)");
+  Serial.printf("MiniSEED encoding: %s\n", deviceConfig.miniseed_steim2 ? "Steim2" : "uncompressed int32");
+  Serial.printf("SD free space: %ld MB\n", (long)sdStorageFreeMb());
   Serial.printf("Reference-position averaging window: %u s\n", (unsigned)deviceConfig.reference_window_s);
   if (referencePositionIsLocked()) {
     double lat, lon, alt;
@@ -195,6 +198,10 @@ void runFieldService() {
       promptFloat("Low-battery cutoff (V)", &deviceConfig.low_battery_cutoff_v);
     } else if (choice == "F" || choice == "f") {
       setSeedCodes();
+    } else if (choice == "G" || choice == "g") {
+      deviceConfig.miniseed_steim2 = !deviceConfig.miniseed_steim2;
+      Serial.println(deviceConfig.miniseed_steim2 ? F("MiniSEED encoding: Steim2 (compressed).")
+                                                  : F("MiniSEED encoding: uncompressed int32."));
     } else if (choice == "E" || choice == "e") {
       promptUInt("NTRIP on every Nth burst (1 = every burst)", &deviceConfig.ntrip_every_n_bursts);
       if (deviceConfig.ntrip_every_n_bursts == 0) {

@@ -4,6 +4,7 @@
 #include "geophone_parse.h"
 #include "geophone_timing.h"
 #include "ubx.h"
+#include "test_mseed.inc"
 
 void setUp() {}
 void tearDown() {}
@@ -177,5 +178,10 @@ int main(int, char **) {
   RUN_TEST(test_channel_continuity_and_resync);
   RUN_TEST(test_ubx_checksum_matches_existing_frames);
   RUN_TEST(test_ubx_build_cfg_msg);
+  RUN_TEST(test_steim2_roundtrip_quiet_signal);
+  RUN_TEST(test_steim2_roundtrip_mixed_amplitudes);
+  RUN_TEST(test_steim2_extreme_values_and_jumps);
+  RUN_TEST(test_int32_record_and_header);
+  RUN_TEST(test_steim2_write_obspy_fixture);
   return UNITY_END();
 }

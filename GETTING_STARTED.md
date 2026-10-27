@@ -209,6 +209,7 @@ C) Start commissioning (establish reference position)
 D) Set low-battery cutoff (V) - new bursts skipped below this
 E) Set NTRIP on every Nth burst (1 = every burst)
 F) Set MiniSEED network/station/location codes
+G) Toggle MiniSEED Steim2 compression
 0) Save and exit
 ```
 
@@ -223,6 +224,11 @@ Commissioning bursts always use NTRIP.
 network `XX`, station `PERM1`, blank location). Give each station its own
 station code before deploying more than one. Codes are uppercased and
 non-alphanumeric characters dropped; enter `-` for a blank location.
+
+`G` switches MiniSEED between Steim2 (default: lossless, typically 2–4×
+smaller, read natively by ObsPy, SeisComP and libmseed) and plain 32-bit
+integers. Leave it on unless a downstream tool can't read Steim2: a 32 GB
+card holds roughly 4 months of uncompressed data.
 
 Type a single character and press enter to select an option. Numeric/text
 options prompt you for a new value (press enter with nothing typed to keep

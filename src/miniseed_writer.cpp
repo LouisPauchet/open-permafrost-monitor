@@ -3,28 +3,38 @@
 #include "gnss.h"
 #include "device_config.h"
 #include "geophone_timing.h"
+#include "miniseed_record.h"
 #include <string.h>
 #include <stdio.h>
 
-// SEED network/station/location codes come from deviceConfig (field-service
-// menu F) - only changed in field service mode, before the geophone task
-// starts, so reading them here without locking is safe.
+// SEED network/station/location codes and the Steim2 switch come from
+// deviceConfig (field-service menu) - only changed in field service mode,
+// before the geophone task starts, so reading them here without locking is
+// safe.
 
 static const uint32_t DEFAULT_SAMPLE_INTERVAL_US = 5000; // 200 Hz raw digitizer rate - see raspberry_shake.md
-static const int RECORD_LEN = 512;
 // A channel's sample clock is only snapped to the digitizer round's start
 // when they disagree by more than this - 4 samples at 200 Hz. Arrival
 // jitter is already smoothed out by GeoClock, so crossing it means a real
 // discontinuity (lost packet) or accumulated clock drift.
 static const int64_t RESYNC_THRESHOLD_US = 20000;
-static const int SAMPLES_PER_RECORD = 114; // (512 - 48 header - 8 blockette1000) / 4 bytes
+
+// Samples are buffered until they fill a record (a Steim2 record holds a
+// variable number, depending on how well they compress), then records are
+// cut from the front. Room for one maximal Steim2 record plus a few
+// packets beyond it.
+static const size_t CHANNEL_BUFFER_SAMPLES = MSEED_STEIM2_MAX_SAMPLES_PER_RECORD + 300;
+// Always leave room for one more packet (50 samples in practice) - past
+// this, a not-yet-full record is written anyway.
+static const size_t GEOPHONE_PACKET_HEADROOM = 128;
 
 struct ChannelBuffer {
   char name[4];
-  int32_t samples[SAMPLES_PER_RECORD];
-  int count;
+  int32_t samples[CHANNEL_BUFFER_SAMPLES];
+  size_t count;
   int64_t startUs;      // UTC epoch us of samples[0]
-  uint32_t intervalUs;  // sample interval this record was built at
+  uint32_t intervalUs;  // sample interval the buffered samples were taken at
+  int32_t prevSample;   // last sample already written (Steim2's first difference)
   int64_t nextUs;       // where the next packet's first sample is expected
   bool haveNext;
   int64_t lastRoundMs;  // digitizer round (marker MSEC) this channel last stamped from
@@ -32,30 +42,8 @@ struct ChannelBuffer {
 };
 
 static ChannelBuffer channels[3];
-static char dailyDate[9] = "";
 static int64_t dailyDayNumber = -1;
-
-static int dayOfYear(int year, int month, int day) {
-  static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
-  int doy = cum[month - 1] + day;
-  bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
-  if (leap && month > 2) {
-    doy++;
-  }
-  return doy;
-}
-
-static void putU16BE(uint8_t *p, uint16_t v) {
-  p[0] = (v >> 8) & 0xFF;
-  p[1] = v & 0xFF;
-}
-
-static void putU32BE(uint8_t *p, uint32_t v) {
-  p[0] = (v >> 24) & 0xFF;
-  p[1] = (v >> 16) & 0xFF;
-  p[2] = (v >> 8) & 0xFF;
-  p[3] = v & 0xFF;
-}
+static bool lowSpaceReported = false;
 
 static ChannelBuffer *findChannel(const char *name) {
   for (int i = 0; i < 3; i++) {
@@ -85,93 +73,54 @@ static void rotateIfNeeded(int64_t epochUs) {
   char path[48];
   sdBuildDailyPath(path, sizeof(path), "data/geophones/geophone", today, "mseed");
   sdStreamOpen(SD_STREAM_MINISEED, path); // actual open happens on the SD writer task, see sd_storage.h
-  strncpy(dailyDate, today, sizeof(dailyDate) - 1);
   dailyDayNumber = dayNumber;
 }
 
-// Writes one fixed 512-byte MiniSEED data record (SEED v2.4 fixed header +
-// blockette 1000 + uncompressed 32-bit int samples, big-endian throughout).
-static void writeRecord(ChannelBuffer *ch) {
+// Cuts one record from the front of the channel's buffer and queues it for
+// the SD writer task. With onlyIfFull, a record that would consume
+// everything buffered (i.e. isn't full yet) is discarded instead and the
+// samples wait for more - so normal operation only ever writes full
+// records, and partial ones only come from miniseedFlush() or a time step.
+// Returns whether a record was written.
+static bool emitRecord(ChannelBuffer *ch, bool onlyIfFull) {
   if (ch->count == 0) {
-    return;
+    return false;
+  }
+  uint8_t record[MSEED_RECORD_LEN];
+  MseedRecordInfo info = {deviceConfig.seed_network, deviceConfig.seed_station,
+                          deviceConfig.seed_location, ch->name,
+                          ch->seq, ch->startUs, ch->intervalUs};
+  size_t used = mseedBuildRecord(record, info, ch->samples, ch->count, deviceConfig.miniseed_steim2,
+                                 ch->prevSample);
+  if (onlyIfFull && used == ch->count && ch->count < CHANNEL_BUFFER_SAMPLES - GEOPHONE_PACKET_HEADROOM) {
+    return false;
   }
 
-  uint8_t record[RECORD_LEN];
-  memset(record, 0, sizeof(record));
-
-  char seqStr[7];
-  snprintf(seqStr, sizeof(seqStr), "%06lu", (unsigned long)(ch->seq % 1000000));
-  memcpy(record, seqStr, 6);
-  record[6] = 'D'; // data header/quality indicator
-  record[7] = ' '; // reserved
-
-  memset(record + 8, ' ', 5);
-  size_t staLen = strlen(deviceConfig.seed_station);
-  memcpy(record + 8, deviceConfig.seed_station, staLen < 5 ? staLen : 5);
-
-  memset(record + 13, ' ', 2);
-  size_t locLen = strlen(deviceConfig.seed_location);
-  memcpy(record + 13, deviceConfig.seed_location, locLen < 2 ? locLen : 2);
-
-  memcpy(record + 15, ch->name, 3);
-
-  memset(record + 18, ' ', 2);
-  size_t netLen = strlen(deviceConfig.seed_network);
-  memcpy(record + 18, deviceConfig.seed_network, netLen < 2 ? netLen : 2);
-
-  // Start time (BTIME, 10 bytes) at offset 20.
-  uint16_t year, milli;
-  uint8_t month, day, hour, minute, second;
-  gnssCivilFromEpochMillis((uint64_t)(ch->startUs / 1000), &year, &month, &day, &hour, &minute,
-                           &second, &milli);
-  putU16BE(record + 20, year);
-  putU16BE(record + 22, (uint16_t)dayOfYear(year, month, day));
-  record[24] = hour;
-  record[25] = minute;
-  record[26] = second;
-  record[27] = 0; // unused
-  putU16BE(record + 28, (uint16_t)((ch->startUs / 100) % 10000)); // 0.0001s units
-
-  // Sample rate as factor/multiplier: factor = Hz with multiplier 1 when
-  // that's a whole number (200 Hz in practice); otherwise factor 1000 with
-  // a negative multiplier (= divide) of the interval in ms, i.e.
-  // 1000/ms Hz - exact for any whole-ms interval.
-  putU16BE(record + 30, (uint16_t)ch->count); // number of samples
-  if (ch->intervalUs > 0 && 1000000UL % ch->intervalUs == 0) {
-    putU16BE(record + 32, (uint16_t)(1000000UL / ch->intervalUs));
-    putU16BE(record + 34, 1);
+  // Below the free-space floor the geophone stops being written (the
+  // positions CSV and GNSS raw files are tiny by comparison and keep going)
+  // - the samples are still consumed so timing carries on seamlessly if
+  // space is freed by swapping the card (which reboots anyway).
+  if (sdStorageLowSpace()) {
+    if (!lowSpaceReported) {
+      lowSpaceReported = true;
+      Serial.println(F("MiniSEED: SD card nearly full - geophone recording paused."));
+    }
   } else {
-    uint32_t intervalMs = ch->intervalUs / 1000 ? ch->intervalUs / 1000 : 1;
-    putU16BE(record + 32, 1000);
-    putU16BE(record + 34, (uint16_t)(-(int16_t)intervalMs));
+    lowSpaceReported = false;
+    sdStreamWrite(SD_STREAM_MINISEED, record, MSEED_RECORD_LEN);
   }
 
-  record[36] = 0; // activity flags
-  record[37] = 0; // I/O and clock flags
-  record[38] = 0; // data quality flags
-  record[39] = 1; // number of blockettes that follow
-
-  putU32BE(record + 40, 0); // time correction
-
-  putU16BE(record + 44, 56); // beginning of data (byte offset in record)
-  putU16BE(record + 46, 48); // first blockette offset
-
-  // Blockette 1000 (Data Only SEED Blockette, 8 bytes) at offset 48.
-  putU16BE(record + 48, 1000); // blockette type
-  putU16BE(record + 50, 0);    // next blockette offset (none)
-  record[52] = 3; // encoding format: 32-bit integers
-  record[53] = 1; // word order: big-endian
-  record[54] = 9; // record length = 2^9 = 512
-  record[55] = 0; // reserved
-
-  for (int i = 0; i < ch->count; i++) {
-    putU32BE(record + 56 + i * 4, (uint32_t)ch->samples[i]);
-  }
-
-  sdStreamWrite(SD_STREAM_MINISEED, record, RECORD_LEN);
-
+  ch->prevSample = ch->samples[used - 1];
   ch->seq++;
-  ch->count = 0;
+  ch->startUs += (int64_t)used * ch->intervalUs;
+  ch->count -= used;
+  memmove(ch->samples, ch->samples + used, ch->count * sizeof(ch->samples[0]));
+  return true;
+}
+
+static void emitAll(ChannelBuffer *ch) {
+  while (emitRecord(ch, false)) {
+  }
 }
 
 void initMiniseedWriter() {
@@ -182,6 +131,7 @@ void initMiniseedWriter() {
     channels[i].count = 0;
     channels[i].haveNext = false;
     channels[i].intervalUs = DEFAULT_SAMPLE_INTERVAL_US;
+    channels[i].prevSample = 0;
     channels[i].seq = 1;
   }
 }
@@ -207,10 +157,10 @@ void miniseedAddPacket(const char *channel, const int32_t *samples, size_t n,
   bool resynced = false;
   int64_t t = geoChannelPacketStartUs(&ch->nextUs, &ch->haveNext, roundStartUs,
                                       RESYNC_THRESHOLD_US, &resynced);
-  // A record's samples must be contiguous at one rate - close the partial
-  // one rather than let a time step or rate change land inside it.
+  // A record's samples must be contiguous at one rate - write out what's
+  // buffered rather than let a time step or rate change land inside it.
   if (ch->count > 0 && (resynced || intervalUs != ch->intervalUs)) {
-    writeRecord(ch);
+    emitAll(ch);
   }
   if (resynced && hadClock) {
     // Expected to be rare (a lost packet, or slow digitizer-vs-GNSS clock
@@ -228,24 +178,24 @@ void miniseedAddPacket(const char *channel, const int32_t *samples, size_t n,
     }
     ch->samples[ch->count++] = samples[i];
     t += intervalUs;
-    if (ch->count >= SAMPLES_PER_RECORD) {
-      writeRecord(ch);
+    if (ch->count >= CHANNEL_BUFFER_SAMPLES) {
+      emitRecord(ch, false); // can't normally happen (see GEOPHONE_PACKET_HEADROOM) - never overflow
     }
+  }
+  // Speculative encode each packet: cheap (a few hundred cycles per
+  // sample, 600 samples/s), and keeps every routine record full.
+  while (emitRecord(ch, true)) {
   }
   ch->nextUs = t;
 }
 
-// Moves whatever's currently buffered in RAM (a partial, not-yet-114-sample
-// record) out into the stream, rather than waiting for a full record - so a
-// quiet channel's data still reaches the card within geophone.cpp's MINISEED_FLUSH_INTERVAL_MS
-// instead of waiting indefinitely for enough samples to accumulate. Actually
-// reaching the physical card is the SD writer task's own job now (periodic
-// flush, see sd_storage.cpp) - this function no longer needs to trigger
-// that itself.
+// Moves whatever's currently buffered in RAM (partial records) out into
+// the stream, rather than waiting for full ones - so data reaches the card
+// within geophone.cpp's MINISEED_FLUSH_INTERVAL_MS. Actually reaching the
+// physical card is the SD writer task's own job (periodic flush, see
+// sd_storage.cpp).
 void miniseedFlush() {
   for (int i = 0; i < 3; i++) {
-    if (channels[i].count > 0) {
-      writeRecord(&channels[i]);
-    }
+    emitAll(&channels[i]);
   }
 }

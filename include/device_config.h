@@ -71,6 +71,11 @@ struct DeviceConfig {
   char seed_network[3];  // up to 2 chars
   char seed_station[6];  // up to 5 chars
   char seed_location[3]; // up to 2 chars
+
+  // MiniSEED encoding: Steim2 (lossless compression, typically 2-4x smaller,
+  // read natively by ObsPy/SeisComP/libmseed) or plain 32-bit integers.
+  // Steim2 by default - a 32 GB card otherwise fills in about 4 months.
+  bool miniseed_steim2;
 };
 
 extern DeviceConfig deviceConfig;

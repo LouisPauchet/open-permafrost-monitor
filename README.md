@@ -49,7 +49,7 @@ All pin assignments live in one place: [include/pins.h](include/pins.h).
 | [include/gnss.h](include/gnss.h) / [src/gnss.cpp](src/gnss.cpp) | ZED-F9P UART, NMEA parsing, fix quality/accuracy, EXTINT sleep/wake |
 | [include/ntrip_client.h](include/ntrip_client.h) / [src/ntrip_client.cpp](src/ntrip_client.cpp) | NTRIP caster connection (with retry), RTCM forwarding, GGA relay |
 | [include/geophone.h](include/geophone.h) / [src/geophone.cpp](src/geophone.cpp) | RS3D UART reader, continuous JSON sample stream parser |
-| [include/miniseed_writer.h](include/miniseed_writer.h) / [src/miniseed_writer.cpp](src/miniseed_writer.cpp) | Minimal MiniSEED writer, sample-clock timed and mapped to GNSS UTC |
+| [include/miniseed_writer.h](include/miniseed_writer.h) / [src/miniseed_writer.cpp](src/miniseed_writer.cpp) | Minimal MiniSEED writer (Steim2 by default, record building in `miniseed_record.h`), sample-clock timed and mapped to GNSS UTC |
 | [include/sd_storage.h](include/sd_storage.h) / [src/sd_storage.cpp](src/sd_storage.cpp) | SD-over-SPI mount, daily-rotated file helpers shared by every logger, eject button, USB mass-storage exposure for field service mode |
 | [include/position_log.h](include/position_log.h) / [src/position_log.cpp](src/position_log.cpp) | Daily position CSV — also the MQTT batch buffer |
 | [include/battery.h](include/battery.h) / [src/battery.cpp](src/battery.cpp) | Internal/external battery voltage via ADC |
@@ -173,7 +173,8 @@ On the configured `measurement_interval_s`:
   to upload is kept in NVS and only advanced after a successful upload, so
   failures retry next cycle and a reboot doesn't skip a day. Leaving
   `upload_host` empty disables it.
-  MiniSEED (~230 MB/day uncompressed) and the per-burst GNSS raw files are
+  MiniSEED (~230 MB/day uncompressed, typically a third to half that with
+  the default Steim2 encoding) and the per-burst GNSS raw files are
   **not** uploaded — far too much for LTE-M airtime and battery — and stay
   on the SD card for physical retrieval (field-service USB drive).
 
@@ -202,7 +203,8 @@ array of one such object per unsent position:
       "north_m": 0.012,
       "east_m": -0.004,
       "up_m": -0.031,
-      "horizontal_displacement_m": 0.0127
+      "horizontal_displacement_m": 0.0127,
+      "sd_free_mb": 27310
     }
   }
 ]
@@ -217,6 +219,9 @@ rows omit `latitude`/`longitude`/`altitude`/accuracy entirely.
 `has_displacement`/`north_m`/`east_m`/`up_m` are only meaningful
 once a reference position has been commissioned (field service menu);
 `horizontal_displacement_m` is derived (not stored), `sqrt(north² + east²)`.
+`sd_free_mb` is the card's free space (refreshed every minute); below 1 GB
+the geophone MiniSEED stream pauses so the small positions CSV and GNSS raw
+files keep recording.
 
 ## Build & flash
 

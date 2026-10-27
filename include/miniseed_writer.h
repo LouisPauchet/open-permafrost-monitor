@@ -2,7 +2,8 @@
 #include <Arduino.h>
 
 // Minimal, from-scratch MiniSEED writer: fixed 512-byte SEED data records,
-// uncompressed 32-bit integer encoding (format code 3) - not Steim1/2. One
+// Steim2 by default or uncompressed 32-bit integers (deviceConfig
+// miniseed_steim2; record building in miniseed_record.h). One
 // combined daily file holds interleaved records from all three geophone
 // channels. Record start times come from the digitizer's own sample clock,
 // mapped onto GNSS UTC - see geophone_timing.h. Called only from the

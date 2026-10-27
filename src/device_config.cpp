@@ -35,6 +35,7 @@ static void applyDefaults() {
   copyField(deviceConfig.seed_network, sizeof(deviceConfig.seed_network), "XX");
   copyField(deviceConfig.seed_station, sizeof(deviceConfig.seed_station), "PERM1");
   copyField(deviceConfig.seed_location, sizeof(deviceConfig.seed_location), "");
+  deviceConfig.miniseed_steim2 = true;
 
   copyField(deviceConfig.upload_host, sizeof(deviceConfig.upload_host), UPLOAD_HOST);
   deviceConfig.upload_port = UPLOAD_PORT;
@@ -78,6 +79,7 @@ void loadDeviceConfig() {
       prefs.getString("seed_sta", loaded.seed_station, sizeof(loaded.seed_station));
       prefs.getString("seed_loc", loaded.seed_location, sizeof(loaded.seed_location));
     }
+    loaded.miniseed_steim2 = prefs.getBool("mseed_steim2", loaded.miniseed_steim2);
 
     prefs.getString("upload_host", loaded.upload_host, sizeof(loaded.upload_host));
     loaded.upload_port = prefs.getUShort("upload_port", loaded.upload_port);
@@ -128,6 +130,7 @@ void saveDeviceConfig() {
   prefs.putString("seed_net", deviceConfig.seed_network);
   prefs.putString("seed_sta", deviceConfig.seed_station);
   prefs.putString("seed_loc", deviceConfig.seed_location);
+  prefs.putBool("mseed_steim2", deviceConfig.miniseed_steim2);
 
   prefs.putString("upload_host", deviceConfig.upload_host);
   prefs.putUShort("upload_port", deviceConfig.upload_port);

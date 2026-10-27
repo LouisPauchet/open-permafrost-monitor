@@ -2,6 +2,7 @@
 #include "pins.h"
 #include "sd_storage.h"
 #include "ubx.h"
+#include "utc_civil.h"
 #include <TinyGPSPlus.h>
 #include <string.h>
 #include <stdlib.h>
@@ -576,18 +577,6 @@ uint8_t gnssMinute() { return gps.time.minute(); }
 uint8_t gnssSecond() { return gps.time.second(); }
 uint16_t gnssMillisecond() { return gps.time.centisecond() * 10; }
 
-// Howard Hinnant's days_from_civil algorithm (public domain) - avoids any
-// mktime()/timezone dependency for a straightforward UTC-to-epoch
-// conversion.
-static int64_t daysFromCivilUTC(int y, unsigned m, unsigned d) {
-  y -= m <= 2;
-  int64_t era = (y >= 0 ? y : y - 399) / 400;
-  unsigned yoe = (unsigned)(y - era * 400);
-  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + (int64_t)doe - 719468;
-}
-
 uint64_t gnssEpochMillis() {
   int64_t days = daysFromCivilUTC(gnssYear(), gnssMonth(), gnssDay());
   uint64_t secs =
@@ -678,23 +667,6 @@ uint64_t gnssEpochMillisNow() {
   unsigned long atMillis = epochAnchorAtMillis;
   portEXIT_CRITICAL(&anchorMux);
   return anchorMs + (uint64_t)(millis() - atMillis);
-}
-
-// Howard Hinnant's civil_from_days algorithm (public domain) - inverse of
-// daysFromCivilUTC() above.
-static void civilFromDaysUTC(int64_t z, int *y, unsigned *m, unsigned *d) {
-  z += 719468;
-  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
-  unsigned doe = (unsigned)(z - era * 146097);                         // [0, 146096]
-  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-  int64_t yy = (int64_t)yoe + era * 400;
-  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-  unsigned mp = (5 * doy + 2) / 153;                      // [0, 11]
-  unsigned dd = doy - (153 * mp + 2) / 5 + 1;             // [1, 31]
-  unsigned mm = mp < 10 ? mp + 3 : mp - 9;                // [1, 12]
-  *y = (int)(yy + (mm <= 2 ? 1 : 0));
-  *m = mm;
-  *d = dd;
 }
 
 // Broken-down UTC calendar fields for gnssEpochMillisNow() - what
