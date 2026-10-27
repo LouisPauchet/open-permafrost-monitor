@@ -325,7 +325,10 @@ struct StreamRing {
 struct StreamState {
   File file;
   char pendingPath[64] = "";
-  char pendingHeader[128] = ""; // empty = no header requested for this open
+  // Empty = no header requested for this open. Was 128, which silently cut
+  // the positions CSV header (177 chars) after "battery_intern" in every
+  // file written so far - sdStreamOpen() now warns if one doesn't fit.
+  char pendingHeader[256] = "";
   volatile bool openPending = false;
   volatile bool closePending = false;
   volatile bool flushPending = false;
@@ -460,6 +463,10 @@ void sdStreamOpen(SdStream stream, const char *path, const char *headerIfEmpty) 
   strncpy(st.pendingPath, path, sizeof(st.pendingPath) - 1);
   st.pendingPath[sizeof(st.pendingPath) - 1] = '\0';
   if (headerIfEmpty) {
+    if (strlen(headerIfEmpty) >= sizeof(st.pendingHeader)) {
+      Serial.printf("SD: header for %s longer than %u bytes - truncated.\n", path,
+                    (unsigned)sizeof(st.pendingHeader) - 1);
+    }
     strncpy(st.pendingHeader, headerIfEmpty, sizeof(st.pendingHeader) - 1);
     st.pendingHeader[sizeof(st.pendingHeader) - 1] = '\0';
   } else {

@@ -164,9 +164,10 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
   while (f.available() && count < MAX_ROWS) {
     String line = f.readStringUntil('\n');
     size_t posAfterLine = f.position();
-    // The header row has as many fields as a data row, so the field-count
-    // check below never caught it: it used to go out as a junk row with
-    // ts 0 (1970) at the start of every daily file.
+    // Skip the header row by name: now that it's written in full it has as
+    // many fields as a data row, so the field-count check below wouldn't
+    // catch it (the old, truncated 10-field header only got skipped by
+    // that check by accident).
     if (line.length() == 0 || line.startsWith("time,")) {
       lastGoodPos = posAfterLine;
       continue;
