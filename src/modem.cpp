@@ -1,7 +1,9 @@
 #include "modem.h"
 #include "isrg_root_x1.h"
 #include "geophone.h"
+#include "sd_storage.h"
 #include <WalterModem.h>
+#include <esp_attr.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -152,10 +154,14 @@ static void onSocketReceiveComplete(const WalterModemRsp *rsp, void *args) {
 // for is usually only a few ms wide. A receive that's already in flight
 // when the suppression starts is left alone (its own retry/abandon logic
 // still applies) - this only holds off *new* kickoffs.
-static unsigned long receiveSuppressedUntilMs = 0;
+// Start + duration rather than an absolute deadline, so the comparison
+// survives millis() wrapping (every ~49.7 days of uptime).
+static unsigned long receiveSuppressStartMs = 0;
+static unsigned long receiveSuppressDurationMs = 0;
 
 void modemSuppressReceiveFor(unsigned long ms) {
-  receiveSuppressedUntilMs = millis() + ms;
+  receiveSuppressStartMs = millis();
+  receiveSuppressDurationMs = ms;
 }
 
 // Called from the main loop only (modemSocketAvailable()/Read()) - kicks
@@ -176,7 +182,7 @@ static void drainSocketRing() {
     }
   }
 
-  if (millis() < receiveSuppressedUntilMs) {
+  if (millis() - receiveSuppressStartMs < receiveSuppressDurationMs) {
     return; // holding off for a priority send - see modemSuppressReceiveFor()
   }
 
@@ -206,19 +212,73 @@ static bool isRegistered(WalterModemNetworkRegState state) {
   }
 }
 
+// True once modemInit() has completed. Every AT command path checks it:
+// WalterModem's command queue doesn't even exist until begin() succeeds,
+// and a failed init used to be permanent until the next reboot - nothing
+// ever called modemInit() again, and no socket event handler was ever
+// registered, so NTRIP could never receive anything.
+static bool modemReady = false;
+
+// WalterModem::begin() must only ever run once per boot: it starts its
+// tasks on *static* stacks before the steps that can fail (modem reset,
+// CME/CEREG config), so calling it again after a failure would start a
+// second task on the same stack memory. Everything after begin() in
+// modemInit() is safe to retry (begin() returns early once it succeeded).
+// A failed begin() is instead recovered with a clean reboot, capped so a
+// genuinely dead modem doesn't reboot-loop the station - the geophone and
+// SD logging keep running without it. RTC_NOINIT survives a software
+// reset but not a power cycle (hence the magic check).
+static bool beginAttempted = false;
+static bool beginOk = false;
+static const uint32_t BEGIN_FAIL_MAGIC = 0x4D4F4445; // "MODE"
+static const uint32_t MAX_BEGIN_FAIL_REBOOTS = 3;
+RTC_NOINIT_ATTR static uint32_t beginFailMagic;
+RTC_NOINIT_ATTR static uint32_t beginFailReboots;
+
+static void rebootForFailedBeginIfAllowed() {
+  if (beginFailMagic != BEGIN_FAIL_MAGIC) {
+    beginFailMagic = BEGIN_FAIL_MAGIC;
+    beginFailReboots = 0;
+  }
+  if (beginFailReboots >= MAX_BEGIN_FAIL_REBOOTS) {
+    Serial.println(F("Modem: begin() keeps failing - running without the modem until power cycle."));
+    return;
+  }
+  beginFailReboots++;
+  Serial.printf("Modem: begin() failed - rebooting to retry (%lu/%lu).\n",
+                (unsigned long)beginFailReboots, (unsigned long)MAX_BEGIN_FAIL_REBOOTS);
+  sdStorageCloseAllForReboot();
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
 bool modemInit() {
-  socketRxMutex = xSemaphoreCreateMutex();
+  if (modemReady) {
+    return true;
+  }
+  if (beginAttempted && !beginOk) {
+    return false; // see beginAttempted - modemConnect() handles recovery
+  }
+  if (!socketRxMutex) {
+    socketRxMutex = xSemaphoreCreateMutex();
+  }
 
   // The Sequans modem chip needs real boot time after power-on before it
   // reliably answers AT commands - the reference WalterModem examples all
   // wait 2s before the first call. Without this, setOpState() calls can
   // silently succeed on a not-yet-ready modem while definePDPContext()
   // (which needs the SIM to have settled) fails right after.
-  geophoneAwareDelay(2000);
-
-  if (!modem.begin(&Serial2)) {
-    Serial.println(F("Modem: begin() failed."));
-    return false;
+  if (!beginAttempted) {
+    geophoneAwareDelay(2000);
+    beginAttempted = true;
+    if (!modem.begin(&Serial2)) {
+      Serial.println(F("Modem: begin() failed."));
+      return false;
+    }
+    beginOk = true;
+    beginFailMagic = BEGIN_FAIL_MAGIC;
+    beginFailReboots = 0;
   }
 
   if (!modem.setOpState(WALTER_MODEM_OPSTATE_NO_RF)) {
@@ -279,10 +339,24 @@ bool modemInit() {
 
   modem.setSocketEventHandler(socketEventHandler);
 
+  modemReady = true;
   return true;
 }
 
 bool modemConnect() {
+  if (!modemReady) {
+    if (beginAttempted && !beginOk) {
+      rebootForFailedBeginIfAllowed(); // only returns if the cap is reached
+      return false;
+    }
+    // One retry per call - callers invoke this once per measurement cycle.
+    Serial.println(F("Modem: not initialized yet - retrying init."));
+    if (!modemInit()) {
+      Serial.println(F("Modem: init retry failed."));
+      return false;
+    }
+  }
+
   if (isRegistered(modem.getNetworkRegState())) {
     return true;
   }
@@ -313,16 +387,22 @@ bool modemConnect() {
 // above) has actually finished, not just been kicked off - see main.cpp's
 // modemSleepPending gating.
 void modemSleep() {
+  if (!modemReady) {
+    return;
+  }
   if (!modem.setOpState(WALTER_MODEM_OPSTATE_NO_RF)) {
     Serial.println(F("Modem: setOpState(NO_RF) failed (sleep)."));
   }
 }
 
 bool modemIsConnected() {
-  return isRegistered(modem.getNetworkRegState());
+  return modemReady && isRegistered(modem.getNetworkRegState());
 }
 
 bool modemSocketOpen(const char *host, uint16_t port) {
+  if (!modemReady) {
+    return false;
+  }
   xSemaphoreTake(socketRxMutex, portMAX_DELAY);
   socketRxLen = 0;
   xSemaphoreGive(socketRxMutex);
@@ -371,7 +451,17 @@ bool modemSocketOpen(const char *host, uint16_t port) {
 // despite RTCM flowing traces back to this gap.
 static volatile bool lastSendFailed = false;
 
+// sendBuf (below) is handed to WalterModem by pointer and only read when
+// the modem's "> " prompt arrives - a second modemSocketSend() before that
+// would overwrite the bytes still waiting to go out. Set while a send is
+// outstanding; abandoned after SEND_ABANDON_MS in case its callback never
+// fires (the same "lost command" failure the receive path guards against).
+static volatile bool sendInFlight = false;
+static unsigned long sendStartMs = 0;
+static const unsigned long SEND_ABANDON_MS = 10000;
+
 static void onSocketSendComplete(const WalterModemRsp *rsp, void *args) {
+  sendInFlight = false;
   if (rsp->result != WALTER_MODEM_STATE_OK) {
     lastSendFailed = true;
     Serial.println(F("Modem: async send failed."));
@@ -398,15 +488,33 @@ static void onSocketSendComplete(const WalterModemRsp *rsp, void *args) {
 static uint8_t sendBuf[512];
 
 bool modemSocketSend(const uint8_t *data, size_t len) {
+  if (!modemReady) {
+    return false;
+  }
   if (len > sizeof(sendBuf)) {
     Serial.println(F("Modem: modemSocketSend() payload exceeds sendBuf - dropped."));
     return false;
   }
+  if (sendInFlight) {
+    if (millis() - sendStartMs < SEND_ABANDON_MS) {
+      return false; // previous payload may still be unsent - caller retries shortly
+    }
+    // The callback never came. Whatever WalterModem still holds for that
+    // command may yet read sendBuf, but waiting longer won't make that
+    // safer, and a stuck flag would block every later send.
+    Serial.println(F("Modem: [diag] abandoning a stuck async send."));
+  }
   memcpy(sendBuf, data, len);
 
   static WalterModemRsp sendRsp; // must outlive the async call
-  return modem.socketSend(MODEM_SOCKET_ID, sendBuf, (uint16_t)len, WALTER_MODEM_RAI_NO_INFO,
-                           &sendRsp, onSocketSendComplete, nullptr);
+  sendInFlight = true;
+  sendStartMs = millis();
+  if (!modem.socketSend(MODEM_SOCKET_ID, sendBuf, (uint16_t)len, WALTER_MODEM_RAI_NO_INFO,
+                        &sendRsp, onSocketSendComplete, nullptr)) {
+    sendInFlight = false;
+    return false;
+  }
+  return true;
 }
 
 bool modemLastSendFailed() {
@@ -458,6 +566,9 @@ static void onSocketCloseComplete(const WalterModemRsp *rsp, void *args) {
 }
 
 void modemSocketClose() {
+  if (!modemReady) {
+    return;
+  }
   static WalterModemRsp closeRsp; // must outlive the async call
   modem.socketClose(MODEM_SOCKET_ID, &closeRsp, onSocketCloseComplete, nullptr);
   xSemaphoreTake(socketRxMutex, portMAX_DELAY);

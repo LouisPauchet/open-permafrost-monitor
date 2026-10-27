@@ -41,6 +41,13 @@ static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 // instead of waiting a full GGA_RESEND_INTERVAL_MS - see modemLastSendFailed().
 static const unsigned long GGA_FAILURE_RETRY_MS = 1500;
 static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
+// RTCM normally flows continuously once GGA has reached the caster - this
+// long with nothing new means the caster dropped the session or the
+// receive path wedged, and the rest of the burst would otherwise pass with
+// no corrections at all. Comfortably above GGA_RESEND_INTERVAL_MS, since
+// a VRS mount only starts streaming after the first GGA lands.
+static const unsigned long NTRIP_STALL_TIMEOUT_MS = 15000;
+static const int NTRIP_MAX_RECONNECTS_PER_BURST = 2;
 
 // Safety net for unattended field operation: if loop() (or anything it
 // blocks in) doesn't feed this for WATCHDOG_TIMEOUT_S, the ESP32 reboots
@@ -159,12 +166,19 @@ static void runGnssFixCycle() {
 
   // Per CPOS: first GGA immediately on connect, then every
   // GGA_RESEND_INTERVAL_MS - not delayed by a full interval like a resend.
-  unsigned long nextGgaAttemptMs = 0;
+  // Timer kept as start + delay (not an absolute deadline) so it survives
+  // millis() wrapping.
+  unsigned long ggaTimerStartMs = millis();
+  unsigned long ggaDelayMs = 0;
   if (ntripUp) {
     if (ntripSendGGA(gnssLastGGA())) {
-      nextGgaAttemptMs = millis() + GGA_RESEND_INTERVAL_MS;
+      ggaTimerStartMs = millis();
+      ggaDelayMs = GGA_RESEND_INTERVAL_MS;
     }
   }
+  uint32_t lastRtcmBytes = ntripBytesForwarded();
+  unsigned long lastRtcmProgressMs = millis();
+  int ntripReconnects = 0;
 
   Serial.printf("Waiting up to %u s more for a fix with horizontal accuracy <= %.3f m"
                 " (recording at least %u s for PPK)...\n",
@@ -206,17 +220,37 @@ static void runGnssFixCycle() {
       // pulls the next attempt in, rather than waiting out the full
       // interval as if nothing had gone wrong.
       if (modemLastSendFailed()) {
-        nextGgaAttemptMs = now + GGA_FAILURE_RETRY_MS;
+        ggaTimerStartMs = now;
+        ggaDelayMs = GGA_FAILURE_RETRY_MS;
       }
 
-      if (now >= nextGgaAttemptMs) {
+      if (now - ggaTimerStartMs >= ggaDelayMs) {
         if (ntripSendGGA(gnssLastGGA())) {
-          nextGgaAttemptMs = now + GGA_RESEND_INTERVAL_MS;
+          ggaTimerStartMs = now;
+          ggaDelayMs = GGA_RESEND_INTERVAL_MS;
         } else {
-          // Deferred (a receive was in flight) rather than sent at all -
-          // retry next iteration, not after a fresh full interval.
-          nextGgaAttemptMs = now;
+          // Deferred (a receive or the previous send was in flight) rather
+          // than sent at all - retry next iteration, not after a fresh
+          // full interval.
+          ggaDelayMs = 0;
         }
+      }
+
+      uint32_t rtcmBytes = ntripBytesForwarded();
+      if (rtcmBytes != lastRtcmBytes) {
+        lastRtcmBytes = rtcmBytes;
+        lastRtcmProgressMs = now;
+      } else if (now - lastRtcmProgressMs >= NTRIP_STALL_TIMEOUT_MS &&
+                 ntripReconnects < NTRIP_MAX_RECONNECTS_PER_BURST) {
+        ntripReconnects++;
+        Serial.printf("NTRIP: no RTCM for %lus - reconnecting (%d/%d).\n",
+                      (now - lastRtcmProgressMs) / 1000, ntripReconnects,
+                      NTRIP_MAX_RECONNECTS_PER_BURST);
+        ntripDisconnect();
+        ntripUp = ntripConnect(1);
+        lastRtcmProgressMs = millis();
+        ggaTimerStartMs = millis();
+        ggaDelayMs = 0; // first GGA right away on the new session
       }
     }
 

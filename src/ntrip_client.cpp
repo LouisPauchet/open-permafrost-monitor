@@ -68,7 +68,11 @@ static bool ntripConnectOnce(bool *wasUnauthorized) {
                     "User-Agent: NTRIP WalterClient/1.0\r\n" +
                     "Authorization: Basic " + auth + "\r\n" +
                     "\r\n";
-  modemSocketSend((const uint8_t *)request.c_str(), request.length());
+  if (!modemSocketSend((const uint8_t *)request.c_str(), request.length())) {
+    Serial.println(F("NTRIP request could not be queued."));
+    modemSocketClose();
+    return false;
+  }
 
   String statusLine = socketReadLine(5000);
   if (statusLine.length() == 0) {
@@ -104,7 +108,7 @@ static bool ntripConnectOnce(bool *wasUnauthorized) {
   return true;
 }
 
-bool ntripConnect() {
+bool ntripConnect(int maxAttempts) {
   // A 401 on this caster isn't a real credentials problem - confirmed by
   // the user restarting and having it work again shortly after - but 3
   // retries at a flat 5s (10s total) wasn't long enough: live hardware hit
@@ -119,20 +123,23 @@ bool ntripConnect() {
   // no evidence it needs the same treatment.
   static const int MAX_ATTEMPTS = 5;
   static const unsigned long RETRY_DELAY_UNAUTHORIZED_MS[MAX_ATTEMPTS - 1] = {5000, 15000, 30000, 45000};
+  if (maxAttempts < 1 || maxAttempts > MAX_ATTEMPTS) {
+    maxAttempts = MAX_ATTEMPTS;
+  }
   static const unsigned long RETRY_DELAY_GENERAL_MS = 10000;
 
-  for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
     bool wasUnauthorized = false;
     if (ntripConnectOnce(&wasUnauthorized)) {
       return true;
     }
 
-    if (attempt == MAX_ATTEMPTS) {
+    if (attempt == maxAttempts) {
       break;
     }
 
     unsigned long delayMs = wasUnauthorized ? RETRY_DELAY_UNAUTHORIZED_MS[attempt - 1] : RETRY_DELAY_GENERAL_MS;
-    Serial.printf("NTRIP connect attempt %d/%d failed - retrying in %lus...\n", attempt, MAX_ATTEMPTS,
+    Serial.printf("NTRIP connect attempt %d/%d failed - retrying in %lus...\n", attempt, maxAttempts,
                   delayMs / 1000);
     geophoneAwareDelay(delayMs);
   }
@@ -197,8 +204,10 @@ bool ntripSendGGA(const char *ggaLine) {
   if ((size_t)len >= sizeof(line)) {
     len = sizeof(line) - 1; // truncated - still send what fits rather than nothing
   }
-  modemSocketSend((const uint8_t *)line, (size_t)len);
-  return true;
+  // false = refused because the previous send is still outstanding (see
+  // modemSocketSend()) - the caller retries next iteration, same as for a
+  // busy receive above.
+  return modemSocketSend((const uint8_t *)line, (size_t)len);
 }
 
 uint32_t ntripBytesForwarded() {
