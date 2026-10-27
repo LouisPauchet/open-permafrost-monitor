@@ -48,6 +48,9 @@ static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
 // a VRS mount only starts streaming after the first GGA lands.
 static const unsigned long NTRIP_STALL_TIMEOUT_MS = 15000;
 static const int NTRIP_MAX_RECONNECTS_PER_BURST = 2;
+// Upper bound on waiting for a previous burst's modem job (MQTT/upload)
+// before NTRIP may use the modem - see runGnssFixCycle().
+static const unsigned long MODEM_JOB_WAIT_MS = 60000;
 
 // Safety net for unattended field operation: if loop() (or anything it
 // blocks in) doesn't feed this for WATCHDOG_TIMEOUT_S, the ESP32 reboots
@@ -246,13 +249,33 @@ static void runGnssFixCycle() {
   bool hadInitialFix = gnssHasFix();
   unsigned long initialFixMs = millis();
 
+  // NTRIP every Nth burst (see device_config.h) - commissioning always,
+  // since each of its bursts is meant to be an RTK-quality observation.
+  static uint32_t burstIndex = 0;
+  uint32_t everyN = deviceConfig.ntrip_every_n_bursts ? deviceConfig.ntrip_every_n_bursts : 1;
+  bool ntripThisBurst = referencePositionIsCommissioning() || (burstIndex % everyN) == 0;
+  burstIndex++;
+
   bool ntripUp = false;
-  if (hadInitialFix) {
-    if (modemConnect()) {
+  if (!hadInitialFix) {
+    Serial.println(F("No initial fix within timeout - ending this burst."));
+  } else if (!ntripThisBurst) {
+    Serial.printf("NTRIP skipped this burst (every %lu) - recording raw observations only.\n",
+                  (unsigned long)everyN);
+  } else {
+    // Back-to-back bursts (commissioning) can start while the previous
+    // one's MQTT/upload job is still running on the modem worker - wait it
+    // out rather than drive WalterModem from two tasks at once.
+    unsigned long jobWaitStart = millis();
+    while (modemJobsBusy() && millis() - jobWaitStart < MODEM_JOB_WAIT_MS) {
+      geophoneAwareDelay(100);
+      pollGNSS();
+    }
+    if (modemJobsBusy()) {
+      Serial.println(F("Modem: previous job still running - skipping NTRIP this burst."));
+    } else if (modemConnect()) {
       ntripUp = ntripConnect();
     }
-  } else {
-    Serial.println(F("No initial fix within timeout - skipping NTRIP this cycle."));
   }
 
   // Per CPOS: first GGA immediately on connect, then every
@@ -282,15 +305,26 @@ static void runGnssFixCycle() {
   unsigned long lastStatusPrint = 0;
   bool qualityOk = false;
 
-  // Runs until BOTH: the RTK/NTRIP side is done (good accuracy reached, or
-  // fix_timeout_s gave up) AND the PPK raw-observation floor since the
-  // initial fix has been met - whichever of the two takes longer. A fast RTK
-  // convergence (seen as early as ~20s on live hardware) would otherwise
-  // stop recording well short of ppk_min_duration_s; a slow/failed
-  // convergence already usually exceeds it, but isn't guaranteed to
-  // (fix_timeout_s and ppk_min_duration_s are independently configurable).
-  while (millis() - fixWaitStart < deviceConfig.fix_timeout_s * 1000UL ||
-         (hadInitialFix && millis() - initialFixMs < deviceConfig.ppk_min_duration_s * 1000UL)) {
+  // Runs until BOTH: the RTK/NTRIP side is done (good accuracy reached,
+  // fix_timeout_s gave up, or there's no NTRIP session to converge with)
+  // AND the PPK raw-observation floor since the initial fix has been met -
+  // whichever of the two takes longer. A fast RTK convergence (seen as early
+  // as ~20s on live hardware) would otherwise stop recording well short of
+  // ppk_min_duration_s; a slow/failed convergence already usually exceeds
+  // it, but isn't guaranteed to (fix_timeout_s and ppk_min_duration_s are
+  // independently configurable).
+  //
+  // No initial fix at all ends the burst right away: without one there's no
+  // NTRIP, nothing to converge and no fix-anchored PPK floor, and the F9P
+  // (the biggest draw in a burst) used to stay awake another full
+  // fix_timeout_s for nothing. Likewise without NTRIP there's no RTK
+  // accuracy to wait for, so the PPK floor alone decides.
+  while (hadInitialFix) {
+    bool rtkDone = qualityOk || !ntripUp || millis() - fixWaitStart >= deviceConfig.fix_timeout_s * 1000UL;
+    bool ppkDone = millis() - initialFixMs >= deviceConfig.ppk_min_duration_s * 1000UL;
+    if (rtkDone && ppkDone) {
+      break;
+    }
     esp_task_wdt_reset();
     pollGNSS();
     // See waitForInitialFix()'s identical comment - this is the longer-
@@ -379,13 +413,6 @@ static void runGnssFixCycle() {
       qualityOk = true;
     }
 
-    // Both sides of the loop condition satisfied - stop as soon as that's
-    // true rather than waiting out whichever bound happens to be longer a
-    // second time through the condition check above.
-    if (qualityOk && (!hadInitialFix || millis() - initialFixMs >= deviceConfig.ppk_min_duration_s * 1000UL)) {
-      break;
-    }
-
     // Temporary diagnostic: mid-cycle RTK progress, independent of whether
     // the cycle ever reaches its own end-of-cycle summary print. Live
     // hardware has been hitting a task-watchdog reset ~85-97s into heavy
@@ -449,8 +476,11 @@ static void runGnssFixCycle() {
   // Can't call modemSleep() here directly - the jobs queued above are
   // still running on the modem worker, and cutting radio out from under
   // them would break the AT command in flight. loop() below actually
-  // sleeps once modemJobsBusy() goes false.
-  modemSleepPending = true;
+  // sleeps once modemJobsBusy() goes false. A burst that never woke the
+  // modem (no fix, or NTRIP skipped) leaves it in NO_RF already.
+  if (hadInitialFix && ntripThisBurst) {
+    modemSleepPending = true;
+  }
   gnssSleep();
 }
 
@@ -598,4 +628,9 @@ void loop() {
     modemSleepPending = false;
     modemSleep();
   }
+
+  // Nothing in here is latency-critical any more (the geophone has its own
+  // task, the GNSS UART is buffered and the F9P is asleep most of the
+  // time) - yield instead of spinning the CPU flat out 24/7.
+  delay(10);
 }

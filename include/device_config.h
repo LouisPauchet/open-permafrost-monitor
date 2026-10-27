@@ -29,6 +29,15 @@ struct DeviceConfig {
   // post-process.
   uint32_t ppk_min_duration_s;
 
+  // NTRIP (and with it the modem, MQTT telemetry and the daily upload) only
+  // runs on every Nth GNSS burst - 1 = every burst. The bursts in between
+  // still record UBX raw observations for ppk_min_duration_s and then end
+  // (no RTK accuracy to wait for without corrections), with no modem wake
+  // at all; their PPK base data has to come from elsewhere (e.g. a public
+  // CORS station) since no RTCM is recorded. Commissioning bursts always
+  // use NTRIP. Queued telemetry rows go out on the next NTRIP burst.
+  uint32_t ntrip_every_n_bursts;
+
   // How long a commissioning run (field-service menu) averages GNSS fixes
   // for before locking in the station's reference position - see
   // reference_position.h. Default matches a real static-GNSS survey

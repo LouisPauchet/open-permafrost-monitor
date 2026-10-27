@@ -29,6 +29,7 @@ static void applyDefaults() {
   deviceConfig.fix_timeout_s = 120;          // give up after 2 minutes if not "good"
   deviceConfig.good_accuracy_m = 0.05f;      // 5 cm
   deviceConfig.ppk_min_duration_s = 120;     // 2 minutes of raw observations per cycle
+  deviceConfig.ntrip_every_n_bursts = 1;     // NTRIP on every burst
   deviceConfig.reference_window_s = 7200;    // 2 hours of commissioning averaging
   deviceConfig.low_battery_cutoff_v = 11.8f; // 12V lead-acid, see device_config.h
 
@@ -63,6 +64,10 @@ void loadDeviceConfig() {
     loaded.fix_timeout_s = prefs.getUInt("timeout_s", loaded.fix_timeout_s);
     loaded.good_accuracy_m = prefs.getFloat("accuracy_m", loaded.good_accuracy_m);
     loaded.ppk_min_duration_s = prefs.getUInt("ppk_s", loaded.ppk_min_duration_s);
+    loaded.ntrip_every_n_bursts = prefs.getUInt("ntrip_n", loaded.ntrip_every_n_bursts);
+    if (loaded.ntrip_every_n_bursts == 0) {
+      loaded.ntrip_every_n_bursts = 1; // 0 would mean "never" - not a setting this offers
+    }
     loaded.reference_window_s = prefs.getUInt("ref_win_s", loaded.reference_window_s);
     loaded.low_battery_cutoff_v = prefs.getFloat("batt_cutoff_v", loaded.low_battery_cutoff_v);
 
@@ -109,6 +114,7 @@ void saveDeviceConfig() {
   prefs.putUInt("timeout_s", deviceConfig.fix_timeout_s);
   prefs.putFloat("accuracy_m", deviceConfig.good_accuracy_m);
   prefs.putUInt("ppk_s", deviceConfig.ppk_min_duration_s);
+  prefs.putUInt("ntrip_n", deviceConfig.ntrip_every_n_bursts);
   prefs.putUInt("ref_win_s", deviceConfig.reference_window_s);
   prefs.putFloat("batt_cutoff_v", deviceConfig.low_battery_cutoff_v);
 

@@ -207,8 +207,16 @@ A) Set PPK minimum recording duration (s)
 B) Set reference-position averaging window (s)
 C) Start commissioning (establish reference position)
 D) Set low-battery cutoff (V) - new bursts skipped below this
+E) Set NTRIP on every Nth burst (1 = every burst)
 0) Save and exit
 ```
+
+`E` trades RTK/RTCM coverage for battery: with N > 1, only every Nth GNSS
+burst connects to NTRIP (and with it the modem, MQTT telemetry and the
+daily upload). The bursts in between still record UBX raw observations for
+the PPK minimum duration, then end, without waking the modem. Their PPK
+base data has to come from elsewhere, since no RTCM is recorded for them.
+Commissioning bursts always use NTRIP.
 
 Type a single character and press enter to select an option. Numeric/text
 options prompt you for a new value (press enter with nothing typed to keep

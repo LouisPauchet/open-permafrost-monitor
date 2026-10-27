@@ -494,12 +494,23 @@ void gnssWriteRTCM(const uint8_t *buf, size_t len) {
   GPSSerial.write(buf, len);
 }
 
+// TinyGPS++'s isValid() is sticky - once a field has ever been received it
+// stays "valid" forever, including across backup-mode sleep. Without an age
+// check, every burst after the very first fix ever "had a fix" the instant
+// it woke (so waitForInitialFix() returned immediately and the PPK floor
+// was anchored to wake time, not to a real fix), and a GST accuracy left
+// over from the previous burst could satisfy the quality check before the
+// F9P had reported anything this burst. The F9P outputs at 1 Hz, so
+// anything older than this is stale.
+static const uint32_t GNSS_FRESH_MS = 2000;
+
 bool gnssHasFix() {
-  return gps.location.isValid();
+  return gps.location.isValid() && gps.location.age() < GNSS_FRESH_MS;
 }
 
 int gnssFixQuality() {
-  return ggaFixQuality.isValid() ? atoi(ggaFixQuality.value()) : 0;
+  return (ggaFixQuality.isValid() && ggaFixQuality.age() < GNSS_FRESH_MS) ? atoi(ggaFixQuality.value())
+                                                                           : 0;
 }
 
 const char *gnssFixQualityLabel(int quality) {
@@ -516,7 +527,9 @@ const char *gnssFixQualityLabel(int quality) {
 }
 
 bool gnssHasAccuracyEstimate() {
-  return gstStdLat.isValid();
+  // Empty fields (no estimate yet) would atof() to 0 m - a "perfect" fix.
+  return gstStdLat.isValid() && gstStdLat.age() < GNSS_FRESH_MS && gstStdLat.value()[0] != '\0' &&
+         gstStdLon.value()[0] != '\0';
 }
 
 float gnssHorizontalAccuracy() {

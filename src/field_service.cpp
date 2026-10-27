@@ -67,6 +67,7 @@ static void printMenu() {
   Serial.println(F("B) Set reference-position averaging window (s)"));
   Serial.println(F("C) Start commissioning (establish reference position)"));
   Serial.println(F("D) Set low-battery cutoff (V) - new bursts skipped below this"));
+  Serial.println(F("E) Set NTRIP on every Nth burst (1 = every burst)"));
   Serial.println(F("0) Save and exit"));
   Serial.print(F("> "));
 }
@@ -77,6 +78,7 @@ static void showConfig() {
   Serial.printf("Fix timeout: %u s\n", (unsigned)deviceConfig.fix_timeout_s);
   Serial.printf("Good accuracy: %.3f m\n", deviceConfig.good_accuracy_m);
   Serial.printf("PPK minimum recording duration: %u s\n", (unsigned)deviceConfig.ppk_min_duration_s);
+  Serial.printf("NTRIP on every %u burst(s)\n", (unsigned)deviceConfig.ntrip_every_n_bursts);
   Serial.printf("Reference-position averaging window: %u s\n", (unsigned)deviceConfig.reference_window_s);
   if (referencePositionIsLocked()) {
     double lat, lon, alt;
@@ -155,6 +157,11 @@ void runFieldService() {
       promptUInt("Reference-position averaging window (s)", &deviceConfig.reference_window_s);
     } else if (choice == "D" || choice == "d") {
       promptFloat("Low-battery cutoff (V)", &deviceConfig.low_battery_cutoff_v);
+    } else if (choice == "E" || choice == "e") {
+      promptUInt("NTRIP on every Nth burst (1 = every burst)", &deviceConfig.ntrip_every_n_bursts);
+      if (deviceConfig.ntrip_every_n_bursts == 0) {
+        deviceConfig.ntrip_every_n_bursts = 1;
+      }
     } else if (choice == "C" || choice == "c") {
       // Antenna needs to already be at its final, permanent mounting
       // position before this is confirmed - the average this starts
