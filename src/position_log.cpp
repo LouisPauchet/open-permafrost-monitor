@@ -90,10 +90,17 @@ void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInte
   uint64_t epochMs = 0;
   currentCivilTime(nullptr, 0, ts, sizeof(ts), &epochMs);
 
+  // No fresh fix (e.g. a no-fix burst that only woke the modem for
+  // telemetry): TinyGPS++ still holds the last position it ever saw, which
+  // must not be logged as this reading's. 0 rather than an empty field -
+  // positionLogReadUnsent() splits with strtok, which collapses empty
+  // fields - and fix_quality 0 tells readers (and the MQTT batch, which
+  // then omits position) to ignore them.
+  bool fix = gnssHasFix();
   char row[256];
   int len = snprintf(
       row, sizeof(row), "%s,%.8f,%.8f,%.2f,%.3f,%.3f,%d,%s,%.2f,%.2f,%s,%.4f,%.4f,%.4f,%llu\n", ts,
-      gnssLatitude(), gnssLongitude(), gnssAltitude(),
+      fix ? gnssLatitude() : 0.0, fix ? gnssLongitude() : 0.0, fix ? gnssAltitude() : 0.0,
       gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f,
       gnssHasAccuracyEstimate() ? gnssVerticalAccuracy() : -1.0f, gnssFixQuality(),
       qualityOk ? "true" : "false", batteryExternalV, batteryInternalV,
@@ -188,12 +195,17 @@ size_t positionLogReadUnsent(char *buf, size_t bufSize) {
     JsonObject row = arr.add<JsonObject>();
     row["ts"] = strtoull(field[14], nullptr, 10);
     JsonObject values = row["values"].to<JsonObject>();
-    values["latitude"] = atof(field[1]);
-    values["longitude"] = atof(field[2]);
-    values["altitude"] = atof(field[3]);
-    values["horizontal_accuracy"] = atof(field[4]);
-    values["vertical_accuracy"] = atof(field[5]);
-    values["fix_quality"] = atoi(field[6]);
+    int fixQuality = atoi(field[6]);
+    // A no-fix row (fix_quality 0) carries placeholder zeros for position -
+    // leave them out rather than plot the station at 0,0 on a dashboard.
+    if (fixQuality > 0) {
+      values["latitude"] = atof(field[1]);
+      values["longitude"] = atof(field[2]);
+      values["altitude"] = atof(field[3]);
+      values["horizontal_accuracy"] = atof(field[4]);
+      values["vertical_accuracy"] = atof(field[5]);
+    }
+    values["fix_quality"] = fixQuality;
     values["quality_ok"] = (strcmp(field[7], "true") == 0);
     values["battery_external_v"] = atof(field[8]);
     values["battery_internal_v"] = atof(field[9]);

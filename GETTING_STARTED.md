@@ -208,6 +208,7 @@ B) Set reference-position averaging window (s)
 C) Start commissioning (establish reference position)
 D) Set low-battery cutoff (V) - new bursts skipped below this
 E) Set NTRIP on every Nth burst (1 = every burst)
+F) Set MiniSEED network/station/location codes
 0) Save and exit
 ```
 
@@ -217,6 +218,11 @@ daily upload). The bursts in between still record UBX raw observations for
 the PPK minimum duration, then end, without waking the modem. Their PPK
 base data has to come from elsewhere, since no RTCM is recorded for them.
 Commissioning bursts always use NTRIP.
+
+`F` sets the SEED codes written into every MiniSEED record (default
+network `XX`, station `PERM1`, blank location). Give each station its own
+station code before deploying more than one. Codes are uppercased and
+non-alphanumeric characters dropped; enter `-` for a blank location.
 
 Type a single character and press enter to select an option. Numeric/text
 options prompt you for a new value (press enter with nothing typed to keep

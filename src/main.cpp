@@ -40,7 +40,7 @@ static const unsigned long GGA_RESEND_INTERVAL_MS = 10000;
 // modemSocketSend() already reported "queued OK") gets retried this soon
 // instead of waiting a full GGA_RESEND_INTERVAL_MS - see modemLastSendFailed().
 static const unsigned long GGA_FAILURE_RETRY_MS = 1500;
-static const unsigned long GST_ENABLE_RETRY_INTERVAL_MS = 5000;
+static const unsigned long GNSS_CONFIG_REFRESH_INTERVAL_MS = 5000;
 // RTCM normally flows continuously once GGA has reached the caster - this
 // long with nothing new means the caster dropped the session or the
 // receive path wedged, and the rest of the burst would otherwise pass with
@@ -80,6 +80,11 @@ static bool modemSleepPending = false; // see runGnssFixCycle()'s end and loop()
 // there's no reason to poll it every loop() iteration when the whole point
 // is a slow-moving pack voltage, not a fast signal.
 static const unsigned long BATTERY_CHECK_INTERVAL_MS = 30000;
+// Bursts stop below low_battery_cutoff_v but only resume this much above
+// it - a pack hovering at the threshold (or sagging under a burst's own
+// load, then recovering once it stops) would otherwise flip between the
+// two every check.
+static const float BATTERY_RESUME_HYSTERESIS_V = 0.2f;
 
 // CPOS (the network RTK service behind this NTRIP mount) documents that a
 // client must already have a regular fix - autonomous is fine - before
@@ -92,7 +97,7 @@ static void waitForInitialFix() {
   Serial.printf("Waiting up to %u s for an initial fix before starting NTRIP...\n",
                 deviceConfig.fix_timeout_s);
   unsigned long start = millis();
-  unsigned long lastGstEnableRetry = 0;
+  unsigned long lastGnssConfigRefresh = 0;
   while (!gnssHasFix() && millis() - start < deviceConfig.fix_timeout_s * 1000UL) {
     esp_task_wdt_reset();
     pollGNSS();
@@ -105,9 +110,9 @@ static void waitForInitialFix() {
     checkFieldModeTrigger();
     sdCheckEjectButton();
     sdCheckCardPresence();
-    if (millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
-      lastGstEnableRetry = millis();
-      gnssEnableGST();
+    if (millis() - lastGnssConfigRefresh >= GNSS_CONFIG_REFRESH_INTERVAL_MS) {
+      lastGnssConfigRefresh = millis();
+      gnssRefreshConfig();
     }
     delay(20);
   }
@@ -269,13 +274,23 @@ static void runGnssFixCycle() {
   bool ntripThisBurst = referencePositionIsCommissioning() || (burstIndex % everyN) == 0;
   burstIndex++;
 
+  // The modem wakes on every NTRIP-scheduled burst, fix or not: without a
+  // fix there's no NTRIP, but the telemetry batch (battery voltages, a
+  // quality_ok=false row) still goes out, so a station with its antenna
+  // snowed in reads as "alive but blind" rather than going silent.
+  bool modemThisBurst = ntripThisBurst;
   bool ntripUp = false;
-  if (!hadInitialFix) {
-    Serial.println(F("No initial fix within timeout - ending this burst."));
-  } else if (!ntripThisBurst) {
-    Serial.printf("NTRIP skipped this burst (every %lu) - recording raw observations only.\n",
-                  (unsigned long)everyN);
+  if (!ntripThisBurst) {
+    if (!hadInitialFix) {
+      Serial.println(F("No initial fix within timeout - ending this burst."));
+    } else {
+      Serial.printf("NTRIP skipped this burst (every %lu) - recording raw observations only.\n",
+                    (unsigned long)everyN);
+    }
   } else {
+    if (!hadInitialFix) {
+      Serial.println(F("No initial fix within timeout - ending this burst (telemetry only)."));
+    }
     // Back-to-back bursts (commissioning) can start while the previous
     // one's MQTT/upload job is still running on the modem worker - wait it
     // out rather than drive WalterModem from two tasks at once.
@@ -285,8 +300,9 @@ static void runGnssFixCycle() {
       pollGNSS();
     }
     if (modemJobsBusy()) {
-      Serial.println(F("Modem: previous job still running - skipping NTRIP this burst."));
-    } else if (modemConnect()) {
+      Serial.println(F("Modem: previous job still running - skipping the modem this burst."));
+      modemThisBurst = false;
+    } else if (modemConnect() && hadInitialFix) {
       ntripUp = ntripConnect();
     }
   }
@@ -313,8 +329,7 @@ static void runGnssFixCycle() {
                 (unsigned)deviceConfig.ppk_min_duration_s);
 
   unsigned long fixWaitStart = millis();
-  unsigned long lastGstEnableRetry = 0;
-  unsigned long lastRxmRtcmDiagResend = 0;
+  unsigned long lastGnssConfigRefresh = 0;
   unsigned long lastStatusPrint = 0;
   bool qualityOk = false;
 
@@ -392,33 +407,12 @@ static void runGnssFixCycle() {
       }
     }
 
-    // The GST-enable command can land before the F9P is ready to process
-    // it, especially right after an EXTINT wake from backup mode - originally
-    // retried only until gnssHasAccuracyEstimate() went true, but live
-    // hardware showed hAcc then freezing at that first value for the rest
-    // of the cycle (qualityOk permanently false: "hAcc=X.XXXm ... good=no"
-    // never changing across 100+s of STATUS lines) - GST sentences
-    // apparently stop actually flowing at some point mid-cycle with no
-    // self-healing retry once isValid() had already gone true once.
-    // Resending unconditionally on the same cadence as RXM-RTCM/RTCM3-input
-    // below (an already-proven fix for the identical "silently stops,
-    // nothing notices" risk class) costs nothing and guarantees this can't
-    // wedge for an entire cycle again.
-    if (millis() - lastGstEnableRetry >= GST_ENABLE_RETRY_INTERVAL_MS) {
-      lastGstEnableRetry = millis();
-      gnssEnableGST();
-    }
-
-    // Temporary diagnostic (RXM-RTCM): same "may land before the F9P is
-    // ready" risk as GST above, but with no isValid()-style flag to gate
-    // on, so just resent unconditionally on the same cadence for the whole
-    // cycle - negligible cost, guarantees it isn't silently lost to timing.
-    if (millis() - lastRxmRtcmDiagResend >= GST_ENABLE_RETRY_INTERVAL_MS) {
-      lastRxmRtcmDiagResend = millis();
-      gnssEnableRxmRtcmDiag();
-      // Same timing risk as the above two - resent on the same cadence.
-      // Suspected real fix for RTK never engaging: see gnss.h.
-      gnssEnableRtcm3Input();
+    // Periodic resend - see gnssRefreshConfig(). GST in particular was
+    // seen to stop flowing mid-burst (hAcc frozen at its first value for
+    // 100+ s, so qualityOk could never go true) with nothing re-enabling it.
+    if (millis() - lastGnssConfigRefresh >= GNSS_CONFIG_REFRESH_INTERVAL_MS) {
+      lastGnssConfigRefresh = millis();
+      gnssRefreshConfig();
     }
 
     if (!qualityOk && gnssHasFix() && gnssHasAccuracyEstimate() &&
@@ -492,8 +486,8 @@ static void runGnssFixCycle() {
   // still running on the modem worker, and cutting radio out from under
   // them would break the AT command in flight. loop() below actually
   // sleeps once modemJobsBusy() goes false. A burst that never woke the
-  // modem (no fix, or NTRIP skipped) leaves it in NO_RF already.
-  if (hadInitialFix && ntripThisBurst) {
+  // modem (NTRIP skipped) leaves it in NO_RF already.
+  if (modemThisBurst) {
     modemSleepPending = true;
   }
   gnssSleep();
@@ -602,7 +596,8 @@ void loop() {
   if (now - lastBatteryCheckMs >= BATTERY_CHECK_INTERVAL_MS) {
     lastBatteryCheckMs = now;
     bool wasOk = batteryOkForBurst;
-    batteryOkForBurst = batteryExternalVoltage() >= deviceConfig.low_battery_cutoff_v;
+    float threshold = deviceConfig.low_battery_cutoff_v + (wasOk ? 0.0f : BATTERY_RESUME_HYSTERESIS_V);
+    batteryOkForBurst = batteryExternalVoltage() >= threshold;
     if (wasOk && !batteryOkForBurst) {
       Serial.printf("Battery: %.2fV below %.2fV cutoff - skipping new GNSS/modem bursts until "
                     "it recovers (geophone/SD logging continues).\n",

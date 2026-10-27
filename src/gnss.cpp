@@ -96,17 +96,6 @@ static const uint8_t UBX_SET_UART1_INPROT_RTCM3X[] = {
   0x22, 0xBF                          // checksum (CK_A, CK_B)
 };
 
-// UBX-CFG-MSG: enable RXM-RTCM (class 0x02, id 0x32) on UART1 - diagnostic
-// only, temporary while chasing why the fix stays autonomous despite a
-// healthy volume of RTCM being forwarded. RXM-RTCM is the F9P's own report
-// of what it did with each incoming RTCM message (type + CRC pass/fail),
-// which is ground truth on whether corrections are actually usable versus
-// just "bytes were sent" - see gnssParseRxmRtcmByte() below.
-static const uint8_t UBX_ENABLE_RXM_RTCM_UART1[] = {
-  0xB5, 0x62, 0x06, 0x01, 0x08, 0x00,
-  0x02, 0x32, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-  0x44, 0x16
-};
 
 // UBX-RXM-PMREQ (class 0x02, id 0x41), 16-byte payload version, requesting
 // indefinite backup mode (duration=0), force+backup flags (0x06 - enters
@@ -357,22 +346,7 @@ static void ubxParseByte(uint8_t c) {
         gnssCaptureUbxFrame(ubxCaptureBuf, ubxCaptureLen);
       }
       if (ok) {
-        if (ubxClass == 0x02 && ubxMsgId == 0x32 && ubxLen >= 8) {
-          // RXM-RTCM payload: version(1) flags(1) reserved/subType(2)
-          // refStation(2) msgType(2). flags bit0 = crcFailed. Confirmed on
-          // live hardware that RTCM validates "ok" here once real
-          // corrections are flowing - only the failure case is still worth
-          // surfacing. Printing every message (routinely several per
-          // second under real RTCM load) was itself a Serial-blocking risk
-          // stacked on top of the others fixed alongside this - same class
-          // of task-watchdog exposure, just smaller.
-          bool crcFailed = ubxPayload[1] & 0x01;
-          if (crcFailed) {
-            uint16_t refStation = (uint16_t)ubxPayload[4] | ((uint16_t)ubxPayload[5] << 8);
-            uint16_t msgType = (uint16_t)ubxPayload[6] | ((uint16_t)ubxPayload[7] << 8);
-            Serial.printf("[RTCM-IN] type=%u station=%u CRC-FAIL\n", msgType, refStation);
-          }
-        } else if (ubxClass == 0x05 && ubxMsgId == 0x00 && ubxLen >= 2) {
+        if (ubxClass == 0x05 && ubxMsgId == 0x00 && ubxLen >= 2) {
           // UBX-ACK-NAK only (id 0x00) - the F9P sends one of ACK/NAK for
           // every UBX-CFG-* message it receives, unconditionally. ACKs are
           // the expected/routine case once the command channel is known to
@@ -386,15 +360,11 @@ static void ubxParseByte(uint8_t c) {
   }
 }
 
-void gnssEnableGST() {
+static void gnssEnableGST() {
   GPSSerial.write(UBX_ENABLE_GST_UART1, sizeof(UBX_ENABLE_GST_UART1));
 }
 
-void gnssEnableRxmRtcmDiag() {
-  GPSSerial.write(UBX_ENABLE_RXM_RTCM_UART1, sizeof(UBX_ENABLE_RXM_RTCM_UART1));
-}
-
-void gnssEnableRtcm3Input() {
+static void gnssEnableRtcm3Input() {
   GPSSerial.write(UBX_SET_UART1_INPROT_RTCM3X, sizeof(UBX_SET_UART1_INPROT_RTCM3X));
 }
 
@@ -402,7 +372,7 @@ void gnssEnableRtcm3Input() {
 // throws an error if the UART is already running. The persistent main
 // loop calls initGNSS() once at startup; each subsequent wake cycle only
 // needs the message-enable resend below (backup mode can reset it), not a
-// fresh UART begin(), so that part is split into gnssReenableMessages().
+// fresh UART begin(), so that part is split into gnssRefreshConfig().
 static bool uartStarted = false;
 
 // Default-on NMEA sentences nothing here reads: TinyGPS++ only needs GGA
@@ -413,27 +383,34 @@ static bool uartStarted = false;
 // comes close to filling the link, and anything that doesn't fit is
 // dropped by the F9P itself - PPK frames included. Rate 0 on UART1 only,
 // RAM layer, so like the other CFG-MSG settings it's resent every wake.
-static const uint8_t NMEA_CLASS = 0xF0;
-static const uint8_t UNUSED_NMEA_IDS[] = {
-    0x01, // GLL
-    0x02, // GSA
-    0x03, // GSV
-    0x05, // VTG
+//
+// RXM-RTCM (the F9P's per-message report on incoming RTCM) was a temporary
+// diagnostic while RTK wasn't engaging - RTK is confirmed working now.
+// Explicitly turned off rather than just no longer enabled, since the
+// module may still have it on in RAM from an earlier firmware.
+struct UbxMsgId {
+  uint8_t cls, id;
+};
+static const UbxMsgId UNUSED_MESSAGES[] = {
+    {0xF0, 0x01}, // NMEA GLL
+    {0xF0, 0x02}, // NMEA GSA
+    {0xF0, 0x03}, // NMEA GSV
+    {0xF0, 0x05}, // NMEA VTG
+    {0x02, 0x32}, // UBX-RXM-RTCM
 };
 
-static void gnssDisableUnusedNmea() {
+static void gnssDisableUnusedMessages() {
   uint8_t frame[UBX_CFG_MSG_FRAME_LEN];
-  for (uint8_t id : UNUSED_NMEA_IDS) {
-    ubxBuildCfgMsgUart1(NMEA_CLASS, id, 0, frame);
+  for (const UbxMsgId &m : UNUSED_MESSAGES) {
+    ubxBuildCfgMsgUart1(m.cls, m.id, 0, frame);
     GPSSerial.write(frame, sizeof(frame));
   }
 }
 
-void gnssReenableMessages() {
-  gnssDisableUnusedNmea();
+void gnssRefreshConfig() {
+  gnssDisableUnusedMessages();
   gnssEnableGST();
   gnssEnableRtcm3Input();
-  GPSSerial.write(UBX_ENABLE_RXM_RTCM_UART1, sizeof(UBX_ENABLE_RXM_RTCM_UART1));
 
   if (sdStorageAvailable()) {
     GPSSerial.write(UBX_ENABLE_RAWX_UART1, sizeof(UBX_ENABLE_RAWX_UART1));
@@ -452,7 +429,7 @@ void initGNSS() {
     delay(100);
   }
 
-  gnssReenableMessages();
+  gnssRefreshConfig();
 }
 
 void gnssSleep() {

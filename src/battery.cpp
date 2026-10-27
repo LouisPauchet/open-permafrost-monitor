@@ -13,9 +13,17 @@ void initBattery() {
   analogReadResolution(12);
 }
 
+// Averaged: single ESP32 ADC reads are noisy by tens of mV at the pin,
+// which the external divider multiplies by ~6.5 - enough to make a pack
+// sitting near low_battery_cutoff_v look like it's crossing it.
+static const int ADC_SAMPLES = 16;
+
 static float readVoltage(int pin, float dividerRatio) {
-  uint32_t mv = analogReadMilliVolts(pin); // chip-calibrated (eFuse) millivolts at the pin
-  return (mv / 1000.0f) * dividerRatio;
+  uint32_t sumMv = 0;
+  for (int i = 0; i < ADC_SAMPLES; i++) {
+    sumMv += analogReadMilliVolts(pin); // chip-calibrated (eFuse) millivolts at the pin
+  }
+  return (sumMv / (float)ADC_SAMPLES / 1000.0f) * dividerRatio;
 }
 
 float batteryExternalVoltage() {

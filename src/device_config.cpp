@@ -32,6 +32,9 @@ static void applyDefaults() {
   deviceConfig.ntrip_every_n_bursts = 1;     // NTRIP on every burst
   deviceConfig.reference_window_s = 7200;    // 2 hours of commissioning averaging
   deviceConfig.low_battery_cutoff_v = 11.8f; // 12V lead-acid, see device_config.h
+  copyField(deviceConfig.seed_network, sizeof(deviceConfig.seed_network), "XX");
+  copyField(deviceConfig.seed_station, sizeof(deviceConfig.seed_station), "PERM1");
+  copyField(deviceConfig.seed_location, sizeof(deviceConfig.seed_location), "");
 
   copyField(deviceConfig.upload_host, sizeof(deviceConfig.upload_host), UPLOAD_HOST);
   deviceConfig.upload_port = UPLOAD_PORT;
@@ -70,6 +73,11 @@ void loadDeviceConfig() {
     }
     loaded.reference_window_s = prefs.getUInt("ref_win_s", loaded.reference_window_s);
     loaded.low_battery_cutoff_v = prefs.getFloat("batt_cutoff_v", loaded.low_battery_cutoff_v);
+    if (prefs.isKey("seed_sta")) { // absent on configs saved by older firmware
+      prefs.getString("seed_net", loaded.seed_network, sizeof(loaded.seed_network));
+      prefs.getString("seed_sta", loaded.seed_station, sizeof(loaded.seed_station));
+      prefs.getString("seed_loc", loaded.seed_location, sizeof(loaded.seed_location));
+    }
 
     prefs.getString("upload_host", loaded.upload_host, sizeof(loaded.upload_host));
     loaded.upload_port = prefs.getUShort("upload_port", loaded.upload_port);
@@ -117,6 +125,9 @@ void saveDeviceConfig() {
   prefs.putUInt("ntrip_n", deviceConfig.ntrip_every_n_bursts);
   prefs.putUInt("ref_win_s", deviceConfig.reference_window_s);
   prefs.putFloat("batt_cutoff_v", deviceConfig.low_battery_cutoff_v);
+  prefs.putString("seed_net", deviceConfig.seed_network);
+  prefs.putString("seed_sta", deviceConfig.seed_station);
+  prefs.putString("seed_loc", deviceConfig.seed_location);
 
   prefs.putString("upload_host", deviceConfig.upload_host);
   prefs.putUShort("upload_port", deviceConfig.upload_port);

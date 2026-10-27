@@ -68,6 +68,7 @@ static void printMenu() {
   Serial.println(F("C) Start commissioning (establish reference position)"));
   Serial.println(F("D) Set low-battery cutoff (V) - new bursts skipped below this"));
   Serial.println(F("E) Set NTRIP on every Nth burst (1 = every burst)"));
+  Serial.println(F("F) Set MiniSEED network/station/location codes"));
   Serial.println(F("0) Save and exit"));
   Serial.print(F("> "));
 }
@@ -79,6 +80,9 @@ static void showConfig() {
   Serial.printf("Good accuracy: %.3f m\n", deviceConfig.good_accuracy_m);
   Serial.printf("PPK minimum recording duration: %u s\n", (unsigned)deviceConfig.ppk_min_duration_s);
   Serial.printf("NTRIP on every %u burst(s)\n", (unsigned)deviceConfig.ntrip_every_n_bursts);
+  Serial.printf("MiniSEED codes: network=%s station=%s location=%s\n", deviceConfig.seed_network,
+                deviceConfig.seed_station,
+                deviceConfig.seed_location[0] ? deviceConfig.seed_location : "(blank)");
   Serial.printf("Reference-position averaging window: %u s\n", (unsigned)deviceConfig.reference_window_s);
   if (referencePositionIsLocked()) {
     double lat, lon, alt;
@@ -129,6 +133,38 @@ static void setUpload() {
   promptString("Upload API key", deviceConfig.upload_api_key, sizeof(deviceConfig.upload_api_key));
 }
 
+// SEED codes are uppercase alphanumeric by spec - normalize what was typed
+// and drop anything else rather than write invalid headers.
+static void normalizeSeedCode(char *code) {
+  size_t out = 0;
+  for (size_t i = 0; code[i] != '\0'; i++) {
+    char c = code[i];
+    if (c >= 'a' && c <= 'z') {
+      c = (char)(c - 'a' + 'A');
+    }
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+      code[out++] = c;
+    }
+  }
+  code[out] = '\0';
+}
+
+static void setSeedCodes() {
+  promptString("Network code (2 chars)", deviceConfig.seed_network, sizeof(deviceConfig.seed_network));
+  normalizeSeedCode(deviceConfig.seed_network);
+  promptString("Station code (up to 5 chars, unique per station)", deviceConfig.seed_station,
+               sizeof(deviceConfig.seed_station));
+  normalizeSeedCode(deviceConfig.seed_station);
+  // An empty answer means "keep" everywhere in this menu, so blanking the
+  // (commonly empty) location code needs its own token.
+  promptString("Location code (up to 2 chars, '-' for blank)", deviceConfig.seed_location,
+               sizeof(deviceConfig.seed_location));
+  if (strcmp(deviceConfig.seed_location, "-") == 0) {
+    deviceConfig.seed_location[0] = '\0';
+  }
+  normalizeSeedCode(deviceConfig.seed_location);
+}
+
 void runFieldService() {
   Serial.println(F("Field service mode - config menu below; the SD card is also mounted as a "
                     "USB drive on this same connection for direct file access."));
@@ -157,6 +193,8 @@ void runFieldService() {
       promptUInt("Reference-position averaging window (s)", &deviceConfig.reference_window_s);
     } else if (choice == "D" || choice == "d") {
       promptFloat("Low-battery cutoff (V)", &deviceConfig.low_battery_cutoff_v);
+    } else if (choice == "F" || choice == "f") {
+      setSeedCodes();
     } else if (choice == "E" || choice == "e") {
       promptUInt("NTRIP on every Nth burst (1 = every burst)", &deviceConfig.ntrip_every_n_bursts);
       if (deviceConfig.ntrip_every_n_bursts == 0) {

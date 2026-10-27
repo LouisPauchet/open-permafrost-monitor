@@ -26,24 +26,14 @@ const char *gnssFixQualityLabel(int quality);
 bool gnssHasAccuracyEstimate();
 float gnssHorizontalAccuracy(); // meters, 1-sigma
 float gnssVerticalAccuracy();   // meters, 1-sigma
-// Re-sends the GST-enable command; initGNSS() already calls this once, but
-// it's exposed so callers can retry if the first attempt lands before the
-// F9P (esp. right after an EXTINT wake from backup mode) is ready for it.
-void gnssEnableGST();
-
-// Temporary diagnostic: re-sends the RXM-RTCM enable command, for the same
-// "first attempt may land before the F9P is ready" reason as gnssEnableGST()
-// above. Prints "[RTCM-IN] type=... station=... ok/CRC-FAIL" for every
-// incoming RTCM message the F9P reports processing - ground truth on
-// whether corrections are actually usable, not just "bytes were sent".
-void gnssEnableRxmRtcmDiag();
-
-// Explicitly enables RTCM3 as an *input* protocol on UART1 (UBX-CFG-VALSET,
-// CFG-UART1INPROT-RTCM3X). Suspected real root cause behind RTK never
-// engaging despite RTCM flowing and GGA reaching the caster: if this
-// wasn't already enabled, the F9P would discard every RTCM byte before
-// ever attempting to parse it.
-void gnssEnableRtcm3Input();
+// Re-sends the whole RAM-layer F9P configuration this firmware relies on:
+// unused NMEA/UBX output off, GST on, RTCM3 accepted as input on UART1 (the
+// fix that got RTK engaging - without it the F9P discards every RTCM byte),
+// and RAWX/SFRBX on when SD logging is available. initGNSS() sends it once
+// per wake; the burst loop resends it periodically because a command can
+// land before the F9P is ready right after an EXTINT wake, and GST was seen
+// to stop flowing mid-burst with nothing re-enabling it.
+void gnssRefreshConfig();
 
 double gnssLatitude();
 double gnssLongitude();

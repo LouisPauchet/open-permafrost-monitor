@@ -81,8 +81,10 @@ between measurement cycles:
   NTRIP/MQTT work is done, brought back to `FULL` at the start of the next
   cycle.
 - **Low-battery backoff**: below `low_battery_cutoff_v` (external battery
-  ADC), new GNSS/modem bursts are skipped entirely until the pack recovers
-  — geophone/SD logging (comparatively low draw) keeps running regardless.
+  ADC, averaged over 16 reads), new GNSS/modem bursts are skipped entirely
+  until the pack recovers to 0.2 V above the cutoff (hysteresis, so a pack
+  sagging under burst load doesn't flip on and off) — geophone/SD logging
+  (comparatively low draw) keeps running regardless.
 
 Time itself has the same "frozen while asleep" problem as the RF
 peripherals: GNSS's own UTC fields don't update while the F9P is asleep, so
@@ -209,7 +211,10 @@ array of one such object per unsent position:
 `fix_quality` follows the standard NMEA GGA fix indicator (0=no fix,
 1=autonomous, 2=DGPS, 4=RTK fixed, 5=RTK float). `quality_ok` reflects
 whether `horizontal_accuracy` met the configured threshold before the wait
-timed out. `has_displacement`/`north_m`/`east_m`/`up_m` are only meaningful
+timed out. A burst without a fix still sends a row (battery voltages,
+`fix_quality` 0, `quality_ok` false) so a blind station stays visible; such
+rows omit `latitude`/`longitude`/`altitude`/accuracy entirely.
+`has_displacement`/`north_m`/`east_m`/`up_m` are only meaningful
 once a reference position has been commissioned (field service menu);
 `horizontal_displacement_m` is derived (not stored), `sqrt(north² + east²)`.
 

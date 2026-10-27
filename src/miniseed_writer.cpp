@@ -1,16 +1,14 @@
 #include "miniseed_writer.h"
 #include "sd_storage.h"
 #include "gnss.h"
+#include "device_config.h"
 #include "geophone_timing.h"
 #include <string.h>
 #include <stdio.h>
 
-// SEED identifiers - "XX" is the reserved placeholder network code for
-// unregistered/temporary networks; customize both for a real deployment
-// (each physical station should have a unique station code).
-static const char *STATION_NETWORK = "XX";
-static const char *STATION_CODE = "PERM1";
-static const char *LOCATION_CODE = "";
+// SEED network/station/location codes come from deviceConfig (field-service
+// menu F) - only changed in field service mode, before the geophone task
+// starts, so reading them here without locking is safe.
 
 static const uint32_t DEFAULT_SAMPLE_INTERVAL_US = 5000; // 200 Hz raw digitizer rate - see raspberry_shake.md
 static const int RECORD_LEN = 512;
@@ -108,17 +106,18 @@ static void writeRecord(ChannelBuffer *ch) {
   record[7] = ' '; // reserved
 
   memset(record + 8, ' ', 5);
-  memcpy(record + 8, STATION_CODE, strlen(STATION_CODE) < 5 ? strlen(STATION_CODE) : 5);
+  size_t staLen = strlen(deviceConfig.seed_station);
+  memcpy(record + 8, deviceConfig.seed_station, staLen < 5 ? staLen : 5);
 
   memset(record + 13, ' ', 2);
-  size_t locLen = strlen(LOCATION_CODE);
-  memcpy(record + 13, LOCATION_CODE, locLen < 2 ? locLen : 2);
+  size_t locLen = strlen(deviceConfig.seed_location);
+  memcpy(record + 13, deviceConfig.seed_location, locLen < 2 ? locLen : 2);
 
   memcpy(record + 15, ch->name, 3);
 
   memset(record + 18, ' ', 2);
-  size_t netLen = strlen(STATION_NETWORK);
-  memcpy(record + 18, STATION_NETWORK, netLen < 2 ? netLen : 2);
+  size_t netLen = strlen(deviceConfig.seed_network);
+  memcpy(record + 18, deviceConfig.seed_network, netLen < 2 ? netLen : 2);
 
   // Start time (BTIME, 10 bytes) at offset 20.
   uint16_t year, milli;

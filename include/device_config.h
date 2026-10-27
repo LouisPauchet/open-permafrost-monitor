@@ -63,6 +63,14 @@ struct DeviceConfig {
   // may warrant a site-specific value once real discharge behavior is
   // observed in the field.
   float low_battery_cutoff_v;
+
+  // SEED identifiers written into every MiniSEED record header - must be
+  // unique per physical station once more than one is deployed. "XX" is
+  // the FDSN placeholder network for temporary/unregistered networks.
+  // Uppercase alphanumeric; location may be blank.
+  char seed_network[3];  // up to 2 chars
+  char seed_station[6];  // up to 5 chars
+  char seed_location[3]; // up to 2 chars
 };
 
 extern DeviceConfig deviceConfig;
