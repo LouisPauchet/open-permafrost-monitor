@@ -92,5 +92,9 @@ void gnssCivilNow(uint16_t *year, uint8_t *month, uint8_t *day, uint8_t *hour, u
 void gnssCivilFromEpochMillis(uint64_t ms, uint16_t *year, uint8_t *month, uint8_t *day,
                               uint8_t *hour, uint8_t *minute, uint8_t *second, uint16_t *milli);
 
+// "YYYYMMDD" date arithmetic (UTC calendar) - e.g. stepping the daily
+// upload through days it missed. false if the input isn't a valid date.
+bool gnssDateAddDays(const char *yyyymmdd, int days, char *out, size_t outSize);
+
 const char *gnssLastGGA(); // raw $..GGA line as last seen from the module, "" if none yet
 uint32_t gnssCharsProcessed();

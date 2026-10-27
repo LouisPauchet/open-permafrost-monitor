@@ -2,7 +2,7 @@
 #include <esp_system.h>
 #include <esp_log.h>
 #include <esp_task_wdt.h>
-#include <SD.h> // for enumerating /data/gnss/*.ubx and *.rtcm in runDailyUploadIfNeeded()
+#include <Preferences.h> // daily upload progress, see loadUploadState()
 #include <USB.h> // composite CDC+MSC (see sd_storage.h's sdStorageMsc* functions)
 #include <string.h>
 
@@ -69,7 +69,6 @@ static const uint32_t WATCHDOG_TIMEOUT_S = 60;
 
 static unsigned long lastFixCycleMs = 0;
 static unsigned long lastBatteryCheckMs = 0;
-static char lastUploadedDate[9] = "";
 static bool firstFixCycleDone = false;
 static bool batteryOkForBurst = true;
 static bool modemSleepPending = false; // see runGnssFixCycle()'s end and loop() below
@@ -140,6 +139,98 @@ static void runTelemetryBatch() {
   }
 
   mqttPublishBatchAsync(payload, rows);
+}
+
+// --- Daily upload (positions CSV only) ---
+//
+// Only the small positions CSV goes over the air: a day of uncompressed
+// 200 Hz x 3-channel MiniSEED is ~230 MB, hours of LTE-M radio time a day
+// (and loopTask was blocked for all of it). MiniSEED and the per-burst GNSS
+// raw files stay on the card for physical retrieval.
+//
+// uploadNextDate is the oldest finished UTC day not yet uploaded. It's
+// persisted, only advanced once that day's upload has actually succeeded,
+// and stepped one day at a time, so a failed upload or a reboot across
+// midnight no longer loses a day. Attempts only happen inside a fix cycle
+// (see runGnssFixCycle()), reusing the modem session NTRIP already
+// registered - never on their own wake, and never more than once a cycle.
+static const char *UPLOAD_NVS_NAMESPACE = "upload";
+// Bounds how far back a stale/bogus stored date (or a long outage) can make
+// the catch-up reach - one day is uploaded per cycle.
+static const int UPLOAD_MAX_BACKLOG_DAYS = 14;
+static char uploadNextDate[9] = "";
+static char uploadInFlightDate[9] = "";
+
+static void loadUploadState() {
+  Preferences prefs;
+  prefs.begin(UPLOAD_NVS_NAMESPACE, true);
+  prefs.getString("next_date", uploadNextDate, sizeof(uploadNextDate));
+  prefs.end();
+}
+
+static void saveUploadState() {
+  Preferences prefs;
+  prefs.begin(UPLOAD_NVS_NAMESPACE, false);
+  prefs.putString("next_date", uploadNextDate);
+  prefs.end();
+}
+
+static void startDailyUploadIfDue() {
+  if (deviceConfig.upload_host[0] == '\0' || !gnssHasEpochAnchor() || uploadBusy()) {
+    return;
+  }
+
+  uint16_t year, milli;
+  uint8_t month, day, hour, minute, second;
+  gnssCivilNow(&year, &month, &day, &hour, &minute, &second, &milli);
+  char today[9];
+  snprintf(today, sizeof(today), "%04u%02u%02u", year, month, day);
+
+  char floorDate[9];
+  if (!gnssDateAddDays(today, -UPLOAD_MAX_BACKLOG_DAYS, floorDate, sizeof(floorDate))) {
+    return;
+  }
+  if (strlen(uploadNextDate) != 8 || strcmp(uploadNextDate, today) > 0) {
+    // First run, or a stored date from the future (bad clock at the time):
+    // start tracking from today - nothing finished to upload yet.
+    strncpy(uploadNextDate, today, sizeof(uploadNextDate) - 1);
+    saveUploadState();
+    return;
+  }
+  if (strcmp(uploadNextDate, floorDate) < 0) {
+    Serial.printf("Daily upload: skipping backlog before %s.\n", floorDate);
+    strncpy(uploadNextDate, floorDate, sizeof(uploadNextDate) - 1);
+    saveUploadState();
+  }
+  if (strcmp(uploadNextDate, today) >= 0) {
+    return; // only finished days - today's file is still growing
+  }
+  if (!modemIsConnected()) {
+    return; // retried next cycle
+  }
+
+  // Local path carries the /data subfolder, remote name deliberately
+  // doesn't (the upload backend has no reason to care about this device's
+  // local folder layout).
+  char localPath[64];
+  sdBuildDailyPath(localPath, sizeof(localPath), "data/positions", uploadNextDate, "csv");
+  char remoteName[64];
+  snprintf(remoteName, sizeof(remoteName), "positions_%s.csv", uploadNextDate);
+  if (uploadFileAsync(localPath, remoteName)) {
+    strncpy(uploadInFlightDate, uploadNextDate, sizeof(uploadInFlightDate) - 1);
+    Serial.printf("Daily upload: queued %s.\n", remoteName);
+  }
+}
+
+static void handleUploadResult() {
+  UploadResult r = uploadTakeResult();
+  if (r == UPLOAD_OK) {
+    if (gnssDateAddDays(uploadInFlightDate, 1, uploadNextDate, sizeof(uploadNextDate))) {
+      saveUploadState();
+    }
+  } else if (r == UPLOAD_FAILED) {
+    Serial.printf("Daily upload: %s failed - retrying next cycle.\n", uploadInFlightDate);
+  }
 }
 
 static void runGnssFixCycle() {
@@ -351,81 +442,16 @@ static void runGnssFixCycle() {
   positionLogAppend(qualityOk, batteryExternalVoltage(), batteryInternalVoltage(), hasDisplacement,
                     northM, eastM, upM);
   ntripDisconnect();
-  runTelemetryBatch(); // piggyback on the modem session this cycle already opened for NTRIP
-  // Can't call modemSleep() here directly - runTelemetryBatch() only kicked
-  // the MQTT batch off, it's still running on its own task (see modem.cpp)
-  // and cutting radio out from under it would break the AT command
-  // in-flight. loop() below actually sleeps once mqttBatchBusy() goes false.
+  // Both piggyback on the modem session this cycle already opened for NTRIP,
+  // and both only queue work on the modem worker task (see modem.h).
+  runTelemetryBatch();
+  startDailyUploadIfDue();
+  // Can't call modemSleep() here directly - the jobs queued above are
+  // still running on the modem worker, and cutting radio out from under
+  // them would break the AT command in flight. loop() below actually
+  // sleeps once modemJobsBusy() goes false.
   modemSleepPending = true;
   gnssSleep();
-}
-
-// /data/gnss/ holds many per-burst files a day (see gnss.cpp), not one
-// daily file like the other data types, so it can't use the same
-// sdBuildDailyPath() single-file pattern - upload every *.ubx/*.rtcm whose
-// name starts with the rolled-over date instead. Filenames without a real
-// date prefix (the rare "boot_<millis>..." fallback, see
-// gnssEnsureBurstStamp()) won't match anything and are never uploaded by
-// this - a known, accepted gap for that already-rare case.
-static void uploadGnssBurstFiles(const char *datePrefix) {
-  File dir = SD.open("/data/gnss");
-  if (!dir) {
-    return;
-  }
-  size_t prefixLen = strlen(datePrefix);
-  File f = dir.openNextFile();
-  while (f) {
-    if (!f.isDirectory() && strncmp(f.name(), datePrefix, prefixLen) == 0) {
-      uploadFile(f.path(), f.name());
-    }
-    f = dir.openNextFile();
-  }
-  dir.close();
-}
-
-static void runDailyUploadIfNeeded() {
-  if (!gnssHasDateTime()) {
-    return;
-  }
-
-  char today[9];
-  gnssDateString(today, sizeof(today));
-
-  if (lastUploadedDate[0] == '\0') {
-    // First time we've known the date this boot - nothing "yesterday" to
-    // upload yet, just remember today so we upload once it rolls over.
-    strncpy(lastUploadedDate, today, sizeof(lastUploadedDate) - 1);
-    return;
-  }
-
-  if (strcmp(today, lastUploadedDate) == 0) {
-    return; // still the same day
-  }
-
-  Serial.printf("Date rolled over (%s -> %s) - uploading yesterday's files.\n", lastUploadedDate, today);
-
-  if (!modemConnect()) {
-    Serial.println(F("Daily upload: modem not connected, will retry next loop."));
-    return; // don't advance lastUploadedDate - retry until it actually uploads
-  }
-
-  // Single daily file per type - local path carries the /data subfolder,
-  // remote name deliberately doesn't (the upload backend has no reason to
-  // care about this device's local folder layout).
-  static const char *localPrefixes[] = {"data/geophones/geophone", "data/positions"};
-  static const char *remoteBasenames[] = {"geophone", "positions"};
-  static const char *exts[] = {"mseed", "csv"};
-  for (int i = 0; i < 2; i++) {
-    char localPath[64];
-    sdBuildDailyPath(localPath, sizeof(localPath), localPrefixes[i], lastUploadedDate, exts[i]);
-    char remoteName[64];
-    snprintf(remoteName, sizeof(remoteName), "%s_%s.%s", remoteBasenames[i], lastUploadedDate, exts[i]);
-    uploadFile(localPath, remoteName);
-  }
-
-  uploadGnssBurstFiles(lastUploadedDate);
-
-  strncpy(lastUploadedDate, today, sizeof(lastUploadedDate) - 1);
 }
 
 void setup() {
@@ -458,6 +484,7 @@ void setup() {
 
   loadDeviceConfig();
   referencePositionInit();
+  loadUploadState();
 
   sdStorageInit();
   sdStorageMscBegin();
@@ -561,14 +588,14 @@ void loop() {
     positionLogMarkSent();
   }
 
+  handleUploadResult();
+
   // Deferred from runGnssFixCycle()'s end - only safe to cut radio once the
-  // async MQTT batch that cycle kicked off (if any) has actually finished,
-  // not merely been started. A cycle with nothing to publish clears this on
-  // the very next iteration, since mqttBatchBusy() is already false then.
-  if (modemSleepPending && !mqttBatchBusy()) {
+  // modem jobs that cycle queued (MQTT batch, daily upload) have actually
+  // finished, not merely been started. A cycle with nothing queued clears
+  // this on the very next iteration.
+  if (modemSleepPending && !modemJobsBusy()) {
     modemSleepPending = false;
     modemSleep();
   }
-
-  runDailyUploadIfNeeded();
 }

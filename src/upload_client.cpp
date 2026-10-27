@@ -1,12 +1,26 @@
 #include "upload_client.h"
 #include "device_config.h"
 #include "modem.h"
+#include "sd_storage.h"
 #include <SD.h>
-#include <esp_task_wdt.h>
 
 static const size_t CHUNK_SIZE = 32768; // comfortably under httpSend's 65535-byte cap
 
-bool uploadFile(const char *localPath, const char *remoteFilename) {
+static char jobLocalPath[64];
+static char jobRemoteName[64];
+static volatile bool uploadInFlight = false;
+static volatile UploadResult pendingResult = UPLOAD_NONE;
+
+// Runs on the modem worker task.
+static bool uploadFile(const char *localPath, const char *remoteFilename) {
+  if (!sdStorageAvailable()) {
+    Serial.println(F("Upload: SD unavailable - will retry."));
+    return false;
+  }
+  if (!SD.exists(localPath)) {
+    Serial.printf("Upload: %s doesn't exist - nothing to upload.\n", localPath);
+    return true;
+  }
   File f = SD.open(localPath, FILE_READ);
   if (!f) {
     Serial.printf("Upload: cannot open %s\n", localPath);
@@ -31,12 +45,6 @@ bool uploadFile(const char *localPath, const char *remoteFilename) {
 
   bool ok = true;
   for (size_t part = 0; part < totalParts && ok; part++) {
-    // A full day's file can be thousands of parts - without this, the task
-    // watchdog (see main.cpp) would only ever get fed once, at the top of
-    // the loop() iteration that kicked off this whole multi-part upload,
-    // and falsely reboot the device mid-transfer.
-    esp_task_wdt_reset();
-
     size_t n = f.read(chunk, CHUNK_SIZE);
 
     char path[192];
@@ -55,4 +63,37 @@ bool uploadFile(const char *localPath, const char *remoteFilename) {
   free(chunk);
   f.close();
   return ok;
+}
+
+static void uploadJob(void *) {
+  bool ok = uploadFile(jobLocalPath, jobRemoteName);
+  pendingResult = ok ? UPLOAD_OK : UPLOAD_FAILED;
+  uploadInFlight = false;
+}
+
+bool uploadFileAsync(const char *localPath, const char *remoteFilename) {
+  if (uploadInFlight) {
+    return false;
+  }
+  strncpy(jobLocalPath, localPath, sizeof(jobLocalPath) - 1);
+  jobLocalPath[sizeof(jobLocalPath) - 1] = '\0';
+  strncpy(jobRemoteName, remoteFilename, sizeof(jobRemoteName) - 1);
+  jobRemoteName[sizeof(jobRemoteName) - 1] = '\0';
+  pendingResult = UPLOAD_NONE;
+  uploadInFlight = true;
+  if (!modemRunJob(uploadJob, nullptr)) {
+    uploadInFlight = false;
+    return false;
+  }
+  return true;
+}
+
+bool uploadBusy() {
+  return uploadInFlight;
+}
+
+UploadResult uploadTakeResult() {
+  UploadResult r = pendingResult;
+  pendingResult = UPLOAD_NONE;
+  return r;
 }

@@ -674,6 +674,28 @@ void gnssCivilFromEpochMillis(uint64_t ms, uint16_t *year, uint8_t *month, uint8
   *day = (uint8_t)d;
 }
 
+bool gnssDateAddDays(const char *yyyymmdd, int days, char *out, size_t outSize) {
+  if (strlen(yyyymmdd) != 8) {
+    return false;
+  }
+  char part[5] = {0};
+  memcpy(part, yyyymmdd, 4);
+  int y = atoi(part);
+  memset(part, 0, sizeof(part));
+  memcpy(part, yyyymmdd + 4, 2);
+  unsigned m = (unsigned)atoi(part);
+  memcpy(part, yyyymmdd + 6, 2);
+  unsigned d = (unsigned)atoi(part);
+  if (m < 1 || m > 12 || d < 1 || d > 31) {
+    return false;
+  }
+  int yy;
+  unsigned mm, dd;
+  civilFromDaysUTC(daysFromCivilUTC(y, m, d) + days, &yy, &mm, &dd);
+  snprintf(out, outSize, "%04d%02u%02u", yy, mm, dd);
+  return true;
+}
+
 const char *gnssLastGGA() {
   return haveGGA ? lastGGA : "";
 }

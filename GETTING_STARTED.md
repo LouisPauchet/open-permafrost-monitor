@@ -242,8 +242,8 @@ Two ways, both covered above: the physical eject button (GPIO 41 — safely
 unmounts and cuts power to the card so you can pull it and read it in a
 laptop's own card reader), or field-service mode's USB drive access (leave
 the card in place, just plug in the service cable and browse it directly).
-If MQTT/upload credentials are configured, position telemetry and daily
-file uploads happen automatically over the cellular link too — see
+If MQTT/upload credentials are configured, position telemetry and the
+daily positions-CSV upload happen automatically over the cellular link too — see
 README.md's "Telemetry and daily upload" section for the formats.
 
 ## 8. Troubleshooting quick reference

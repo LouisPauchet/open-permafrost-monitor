@@ -6,7 +6,9 @@
 #include <esp_attr.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
+#include <atomic>
 #include <string.h>
 
 static WalterModem modem;
@@ -600,11 +602,66 @@ void modemSocketClose() {
 // writer task exactly, same reasoning - picks up a pending batch and runs
 // the whole sequence as ordinary blocking calls, so nothing stacks and nothing
 // can trip the watchdog even if the network stalls. loopTask only stages
-// the batch and notifies; modemMqttBatchBusy()/modemMqttLastBatchOk() are
-// unchanged so main.cpp needed no changes at all for this rewrite.
+// the batch and queues it.
+//
+// That task is now a general modem worker (see modemRunJob() below): the
+// daily HTTP upload used to run its blocking AT sequence straight on
+// loopTask, possibly at the same moment this task was mid-MQTT - two tasks
+// issuing blocking WalterModem commands at once, which design note (1) at
+// the top of this file already established is unsafe - and could block
+// loopTask past the watchdog on a slow network. Every blocking AT
+// sequence now goes through the one worker, one job at a time.
 static volatile bool mqttBatchInFlight = false;
 static volatile bool mqttBatchOkPending = false;
-static TaskHandle_t mqttTaskHandle = nullptr;
+
+struct ModemJob {
+  ModemJobFn fn;
+  void *ctx;
+};
+static const UBaseType_t MODEM_JOB_QUEUE_LEN = 4;
+static QueueHandle_t modemJobQueue = nullptr;
+static TaskHandle_t modemWorkerHandle = nullptr;
+// Queued + running. Incremented by modemRunJob() before queueing,
+// decremented by the worker only after a job has fully returned, so
+// modemJobsBusy() can never read false while AT work is still pending.
+static std::atomic<int> modemJobsOutstanding{0};
+
+static void modemWorkerFn(void *) {
+  ModemJob job;
+  for (;;) {
+    if (xQueueReceive(modemJobQueue, &job, portMAX_DELAY) == pdTRUE) {
+      job.fn(job.ctx);
+      modemJobsOutstanding--;
+    }
+  }
+}
+
+bool modemRunJob(ModemJobFn fn, void *ctx) {
+  if (!modemReady) {
+    return false;
+  }
+  if (!modemWorkerHandle) {
+    modemJobQueue = xQueueCreate(MODEM_JOB_QUEUE_LEN, sizeof(ModemJob));
+    // Core 0 alongside the SD writer and geophone tasks - core 1 already
+    // carries loopTask plus WalterModem's own queueProcessing/
+    // eventProcessing tasks. Stack sized well above what a single AT
+    // command round trip needs (the crash the original MQTT task replaced
+    // was exactly a stack-size problem) plus the upload job's SD reads.
+    xTaskCreatePinnedToCore(modemWorkerFn, "modemWorker", 8192, NULL, 1, &modemWorkerHandle, 0);
+  }
+  ModemJob job = {fn, ctx};
+  modemJobsOutstanding++;
+  if (xQueueSend(modemJobQueue, &job, 0) != pdTRUE) {
+    modemJobsOutstanding--;
+    Serial.println(F("Modem: job queue full - job dropped."));
+    return false;
+  }
+  return true;
+}
+
+bool modemJobsBusy() {
+  return modemJobsOutstanding.load() > 0;
+}
 
 static char mqttHost[64];
 static uint16_t mqttPort;
@@ -637,48 +694,42 @@ static void mqttEventHandler(WMMQTTEventType event, const WMMQTTEventData *data,
   }
 }
 
-static void mqttTaskFn(void *) {
-  for (;;) {
-    // Blocks here (no busy-poll) until modemMqttPublishBatchAsync() has
-    // staged a batch and wakes this task with xTaskNotifyGive().
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+static void mqttBatchJob(void *) {
+  // WalterModem::mqttConfig only emits username/password when *both*
+  // pointers are non-NULL - it won't send a lone username. ThingsBoard's
+  // convention (and this deployment's secrets.h) is username-as-token
+  // with a blank password, so an empty password must still be passed as
+  // "" here, not NULL, or the real username silently never reaches the
+  // AT command.
+  const char *userArg = mqttUser[0] ? mqttUser : NULL;
+  const char *passArg = userArg ? mqttPass : NULL;
 
-    // WalterModem::mqttConfig only emits username/password when *both*
-    // pointers are non-NULL - it won't send a lone username. ThingsBoard's
-    // convention (and this deployment's secrets.h) is username-as-token
-    // with a blank password, so an empty password must still be passed as
-    // "" here, not NULL, or the real username silently never reaches the
-    // AT command.
-    const char *userArg = mqttUser[0] ? mqttUser : NULL;
-    const char *passArg = userArg ? mqttPass : NULL;
-
-    bool ok = false;
-    if (!modem.mqttConfig(mqttClientId, userArg, passArg, mqttTlsProfile)) {
-      Serial.println(F("MQTT: config failed."));
+  bool ok = false;
+  if (!modem.mqttConfig(mqttClientId, userArg, passArg, mqttTlsProfile)) {
+    Serial.println(F("MQTT: config failed."));
+  } else {
+    mqttConnectedOk = false;
+    xSemaphoreTake(mqttConnectDoneSem, 0); // drain any stale pending signal
+    if (!modem.mqttConnect(mqttHost, mqttPort, 60)) {
+      Serial.println(F("MQTT: connect failed."));
+    } else if (xSemaphoreTake(mqttConnectDoneSem, pdMS_TO_TICKS(10000)) != pdTRUE) {
+      Serial.println(F("MQTT: connect timed out waiting for broker confirmation."));
+    } else if (!mqttConnectedOk) {
+      Serial.println(F("MQTT: broker rejected the connection."));
+    } else if (!modem.mqttPublish(mqttTopic, mqttPayload, mqttPayloadLen, 1)) {
+      Serial.println(F("MQTT: publish failed."));
     } else {
-      mqttConnectedOk = false;
-      xSemaphoreTake(mqttConnectDoneSem, 0); // drain any stale pending signal
-      if (!modem.mqttConnect(mqttHost, mqttPort, 60)) {
-        Serial.println(F("MQTT: connect failed."));
-      } else if (xSemaphoreTake(mqttConnectDoneSem, pdMS_TO_TICKS(10000)) != pdTRUE) {
-        Serial.println(F("MQTT: connect timed out waiting for broker confirmation."));
-      } else if (!mqttConnectedOk) {
-        Serial.println(F("MQTT: broker rejected the connection."));
-      } else if (!modem.mqttPublish(mqttTopic, mqttPayload, mqttPayloadLen, 1)) {
-        Serial.println(F("MQTT: publish failed."));
-      } else {
-        ok = true;
-        Serial.println(F("MQTT: publish succeeded."));
-      }
+      ok = true;
+      Serial.println(F("MQTT: publish succeeded."));
     }
-    // Always, win or lose - leaving a half-open session behind is exactly
-    // what open_renewable_lab's be_connect() comment describes as wedging
-    // the *next* mqttConfig() call outright.
-    modem.mqttDisconnect();
-
-    mqttBatchOkPending = ok;
-    mqttBatchInFlight = false; // batch is over either way
   }
+  // Always, win or lose - leaving a half-open session behind is exactly
+  // what open_renewable_lab's be_connect() comment describes as wedging
+  // the *next* mqttConfig() call outright.
+  modem.mqttDisconnect();
+
+  mqttBatchOkPending = ok;
+  mqttBatchInFlight = false; // batch is over either way
 }
 
 bool modemMqttPublishBatchAsync(const char *host, uint16_t port, const char *clientId,
@@ -693,17 +744,12 @@ bool modemMqttPublishBatchAsync(const char *host, uint16_t port, const char *cli
     return false;
   }
 
-  if (!mqttTaskHandle) {
+  if (!modemReady) {
+    return false;
+  }
+  if (!mqttConnectDoneSem) {
     mqttConnectDoneSem = xSemaphoreCreateBinary();
     modem.setMQTTEventHandler(mqttEventHandler, nullptr);
-    // Core 0 alongside the SD writer task - core 1 already carries
-    // loopTask plus WalterModem's own queueProcessing/eventProcessing
-    // tasks (see modem.cpp's design notes above). Stack sized well above
-    // what a single AT command round trip needs; the crash this replaces
-    // was exactly a stack-size problem, so this errs generous rather than
-    // matching queueProcessing's own (evidently too small for chaining)
-    // stack.
-    xTaskCreatePinnedToCore(mqttTaskFn, "mqttTask", 8192, NULL, 1, &mqttTaskHandle, 0);
   }
 
   strncpy(mqttHost, host, sizeof(mqttHost) - 1);
@@ -733,7 +779,10 @@ bool modemMqttPublishBatchAsync(const char *host, uint16_t port, const char *cli
   mqttPayloadLen = (uint16_t)len;
 
   mqttBatchInFlight = true;
-  xTaskNotifyGive(mqttTaskHandle);
+  if (!modemRunJob(mqttBatchJob, nullptr)) {
+    mqttBatchInFlight = false;
+    return false;
+  }
   return true;
 }
 
@@ -753,6 +802,9 @@ bool modemMqttLastBatchOk() {
 // CSV); upload_client.cpp chunks anything larger into repeated calls.
 bool modemHttpPost(const char *host, uint16_t port, const char *path,
                     const char *apiKey, const uint8_t *body, size_t bodyLen) {
+  if (!modemReady) {
+    return false;
+  }
   if (bodyLen > 65535) {
     Serial.println(F("Modem: modemHttpPost body exceeds 65535 bytes - caller must chunk."));
     return false;

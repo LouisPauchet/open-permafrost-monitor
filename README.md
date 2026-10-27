@@ -160,12 +160,20 @@ On the configured `measurement_interval_s`:
   goes out as one message; async (doesn't block the fix cycle), and rows
   that fail to send (modem down, batch already in flight) stay unsent and
   retry next cycle.
-- **Daily upload**: on GNSS-date rollover, POSTs the previous day's four
-  rotated files (geophone MiniSEED, GNSS raw log, NTRIP raw log, position
-  CSV) in 32KB chunks to a backend the user runs themselves, authenticated
-  with a single API key (HTTP Basic auth). That backend — not part of this
+- **Daily upload**: once a UTC day is over, POSTs that day's positions CSV
+  in 32KB chunks to a backend the user runs themselves, authenticated with
+  a single API key (HTTP Basic auth). That backend — not part of this
   firmware — is responsible for forwarding to actual S3-compatible storage;
   the device never holds cloud-storage credentials, only one rotatable key.
+  The upload runs at the end of a fix cycle on the modem session NTRIP
+  already opened (so it's battery-gated like any burst and adds no wake of
+  its own), on the modem worker task alongside the MQTT batch. The next day
+  to upload is kept in NVS and only advanced after a successful upload, so
+  failures retry next cycle and a reboot doesn't skip a day. Leaving
+  `upload_host` empty disables it.
+  MiniSEED (~230 MB/day uncompressed) and the per-burst GNSS raw files are
+  **not** uploaded — far too much for LTE-M airtime and battery — and stay
+  on the SD card for physical retrieval (field-service USB drive).
 
 ## MQTT payload
 
