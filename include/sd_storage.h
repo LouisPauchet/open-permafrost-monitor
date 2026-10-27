@@ -16,7 +16,10 @@ bool sdStorageAvailable();
 
 // Polls SD_CARD_DETECT_PIN (debounced) - reboots to cleanly mount a newly
 // (re)inserted card, or marks storage unavailable the moment one is pulled
-// rather than waiting for the next write to fail. Call every loop().
+// rather than waiting for the next write to fail. A card that's present but
+// unusable (failed mount, latched write failure) gets at most 2 recovery
+// reboots in a row before the station carries on without SD. Call every
+// loop().
 void sdCheckCardPresence();
 
 // Polls SD_EJECT_BUTTON_PIN (debounced, see pins.h) - on a press, flushes
@@ -86,6 +89,11 @@ bool sdStreamIsOpen(SdStream stream);
 // Appends data to the stream's ring buffer. Fast and non-blocking - the
 // actual SD write happens later, on the writer task.
 void sdStreamWrite(SdStream stream, const uint8_t *data, size_t len);
+
+// Total bytes dropped across all streams since boot because a ring buffer
+// was full - should stay 0; anything else means the writer task (i.e. the
+// card) isn't keeping up and data is being lost.
+uint32_t sdStreamDroppedBytes();
 
 // Requests that the writer task flush this stream's file as soon as it next
 // drains the ring buffer (still off-caller's-task, still non-blocking here)

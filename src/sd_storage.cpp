@@ -3,6 +3,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <USBMSC.h>
+#include <esp_attr.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
@@ -35,6 +36,17 @@ static bool available = false;
 // from immediately auto-remounting a card that's still sitting in the slot
 // right after it was deliberately powered down for removal.
 static bool ejected = false;
+
+// Writer-task pause handshake (see sdWriterPause()) - set before anything
+// takes the card away from FatFs (eject, USB mass storage), so SD.end() or
+// raw sector access can't land in the middle of a writer-task write.
+static volatile bool writerPauseRequested = false;
+static volatile bool writerPaused = false;
+static void sdWriterPause();
+
+// Per-stream bytes dropped because a ring buffer was full (writer task not
+// keeping up, or paused). Shown in main.cpp's [STATUS] line.
+static volatile uint32_t droppedBytes[SD_STREAM_COUNT] = {};
 
 bool sdStorageInit() {
   pinMode(SD_POWER_EN_PIN, OUTPUT);
@@ -88,42 +100,87 @@ bool sdStorageAvailable() {
 // boot) rather than trying to hand-roll an in-place re-mount that would
 // also need every open-file/rotation-state owner (gnss.cpp,
 // miniseed_writer.cpp, position_log.cpp) reset correctly too.
-// restartAttempted caps this to one restart per detected insertion: if the
-// card still won't mount after that (a real fault, not just a hot-plug
-// timing thing), the station keeps running SD-less instead of
-// reboot-looping forever.
+//
+// Two reasons to reboot, deliberately kept apart:
+// - an insertion seen during this boot (absent, then present) - a
+//   technician swapping cards, always worth one remount;
+// - a card that's present but not usable (failed to mount at boot, or
+//   latched unavailable after a write/open failure) - worth a retry, but
+//   only a bounded number of times in a row. The old single
+//   restartAttempted flag was a plain static, reset by the very reboot it
+//   triggered, so a bad card reboot-looped the whole station forever.
+//   The count lives in RTC_NOINIT memory (survives a software reset, not a
+//   power cycle - hence the magic check) and is cleared after an hour of
+//   healthy operation.
+static const uint32_t SD_RECOVERY_MAGIC = 0x53444341; // "SDCA"
+static const uint32_t SD_MAX_RECOVERY_REBOOTS = 2;
+static const unsigned long SD_HEALTHY_RESET_MS = 3600000UL;
+RTC_NOINIT_ATTR static uint32_t sdRecoveryMagic;
+RTC_NOINIT_ATTR static uint32_t sdRecoveryReboots;
+
+static void sdRebootToRemount(const __FlashStringHelper *why) {
+  Serial.println(why);
+  sdStorageCloseAllForReboot();
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
 void sdCheckCardPresence() {
   static unsigned long presentSinceMs = 0;
   static unsigned long absentSinceMs = 0;
-  static bool restartAttempted = false;
+  static unsigned long availableSinceMs = 0;
+  static bool seenAbsentThisBoot = false;
+  static bool gaveUpReported = false;
   const unsigned long DEBOUNCE_MS = 200;
+
+  if (sdRecoveryMagic != SD_RECOVERY_MAGIC) {
+    sdRecoveryMagic = SD_RECOVERY_MAGIC;
+    sdRecoveryReboots = 0;
+  }
+
+  if (available) {
+    if (availableSinceMs == 0) {
+      availableSinceMs = millis();
+    } else if (sdRecoveryReboots != 0 && millis() - availableSinceMs >= SD_HEALTHY_RESET_MS) {
+      sdRecoveryReboots = 0;
+    }
+  } else {
+    availableSinceMs = 0;
+  }
 
   bool present = digitalRead(SD_CARD_DETECT_PIN) == HIGH;
 
   if (present) {
     absentSinceMs = 0;
-    if (!available && !restartAttempted && !ejected) {
+    if (!available && !ejected) {
       if (presentSinceMs == 0) {
         presentSinceMs = millis();
       } else if (millis() - presentSinceMs >= DEBOUNCE_MS) {
-        restartAttempted = true;
-        Serial.println(F("SD: card detected - rebooting to mount it cleanly."));
-        sdStorageCloseAllForReboot();
-        Serial.flush();
-        delay(100);
-        ESP.restart();
+        if (seenAbsentThisBoot) {
+          sdRebootToRemount(F("SD: card inserted - rebooting to mount it cleanly."));
+        } else if (sdRecoveryReboots < SD_MAX_RECOVERY_REBOOTS) {
+          sdRecoveryReboots++;
+          Serial.printf("SD: card present but unusable - recovery reboot %lu/%lu.\n",
+                        (unsigned long)sdRecoveryReboots, (unsigned long)SD_MAX_RECOVERY_REBOOTS);
+          sdRebootToRemount(F("SD: rebooting to remount."));
+        } else if (!gaveUpReported) {
+          gaveUpReported = true;
+          Serial.println(F("SD: card still unusable after recovery reboots - running without SD "
+                           "until it's reinserted."));
+        }
       }
     }
   } else {
     presentSinceMs = 0;
-    if (available || ejected) {
-      if (absentSinceMs == 0) {
-        absentSinceMs = millis();
-      } else if (millis() - absentSinceMs >= DEBOUNCE_MS) {
+    if (absentSinceMs == 0) {
+      absentSinceMs = millis();
+    } else if (millis() - absentSinceMs >= DEBOUNCE_MS) {
+      seenAbsentThisBoot = true;
+      if (available || ejected) {
         Serial.println(F("SD: card removed - marking storage unavailable."));
         available = false;
         ejected = false;
-        restartAttempted = false; // a freshly (re)inserted card gets its own attempt
       }
     }
   }
@@ -151,6 +208,7 @@ void sdCheckEjectButton() {
   if (available) {
     Serial.println(F("SD: eject button pressed - flushing and unmounting..."));
     sdStorageCloseAllForReboot();
+    sdWriterPause();
     SD.end();
     digitalWrite(SD_POWER_EN_PIN, HIGH); // active LOW enable - HIGH cuts power
     available = false;
@@ -230,6 +288,12 @@ void sdWriterTaskFn(void *) {
   uint8_t local[sizeof(StreamRing::buf)]; // task-owned scratch, not on the stack per-iteration
 
   for (;;) {
+    if (writerPauseRequested) {
+      writerPaused = true; // acknowledged at a point where no SD call is in progress
+      vTaskDelay(drainPeriod);
+      continue;
+    }
+
     for (int s = 0; s < SD_STREAM_COUNT; s++) {
       StreamState &st = g_stream[s];
 
@@ -355,7 +419,31 @@ void sdStreamWrite(SdStream stream, const uint8_t *data, size_t len) {
     memcpy(ring.buf + ring.len, data, n);
     ring.len += n;
   }
+  if (n < len) {
+    droppedBytes[stream] += (uint32_t)(len - n);
+  }
   xSemaphoreGive(ring.mutex);
+}
+
+uint32_t sdStreamDroppedBytes() {
+  uint32_t total = 0;
+  for (int s = 0; s < SD_STREAM_COUNT; s++) {
+    total += droppedBytes[s];
+  }
+  return total;
+}
+
+// Stops the writer task touching the card, and waits (bounded) until it
+// confirms. Never undone - every caller reboots before FatFs is used again.
+static void sdWriterPause() {
+  writerPauseRequested = true;
+  unsigned long start = millis();
+  while (!writerPaused && millis() - start < 1000) {
+    delay(10);
+  }
+  if (!writerPaused) {
+    Serial.println(F("SD: writer task didn't pause in time - proceeding anyway."));
+  }
 }
 
 void sdStreamFlush(SdStream stream) {
@@ -471,5 +559,6 @@ void sdStorageMscEnable() {
     return;
   }
   sdStorageCloseAllForReboot();
+  sdWriterPause();
   usbMsc.mediaPresent(true);
 }

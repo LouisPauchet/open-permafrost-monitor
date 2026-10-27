@@ -427,9 +427,10 @@ static void runGnssFixCycle() {
     // only ever seeing "cycle cut short, no data."
     if (millis() - lastStatusPrint >= 10000) {
       lastStatusPrint = millis();
-      Serial.printf("[STATUS] t=%lus fix=%s hAcc=%.3fm RTCM=%uB\n", (millis() - fixWaitStart) / 1000,
-                    gnssFixQualityLabel(gnssFixQuality()),
-                    gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f, ntripBytesForwarded());
+      Serial.printf("[STATUS] t=%lus fix=%s hAcc=%.3fm RTCM=%uB SDdrop=%luB\n",
+                    (millis() - fixWaitStart) / 1000, gnssFixQualityLabel(gnssFixQuality()),
+                    gnssHasAccuracyEstimate() ? gnssHorizontalAccuracy() : -1.0f, ntripBytesForwarded(),
+                    (unsigned long)sdStreamDroppedBytes());
     }
 
     delay(20);
