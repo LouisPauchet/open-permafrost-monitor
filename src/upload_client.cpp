@@ -11,8 +11,18 @@ static char jobRemoteName[64];
 static volatile bool uploadInFlight = false;
 static volatile UploadResult pendingResult = UPLOAD_NONE;
 
-// Runs on the modem worker task.
+// Runs on the modem worker task. Registered as an SD reader for its whole
+// duration (see sdReaderBegin()), so eject waits for it to abort cleanly.
+static bool uploadFileLocked(const char *localPath, const char *remoteFilename);
+
 static bool uploadFile(const char *localPath, const char *remoteFilename) {
+  sdReaderBegin();
+  bool ok = uploadFileLocked(localPath, remoteFilename);
+  sdReaderEnd();
+  return ok;
+}
+
+static bool uploadFileLocked(const char *localPath, const char *remoteFilename) {
   if (!sdStorageAvailable()) {
     Serial.println(F("Upload: SD unavailable - will retry."));
     return false;
@@ -45,7 +55,22 @@ static bool uploadFile(const char *localPath, const char *remoteFilename) {
 
   bool ok = true;
   for (size_t part = 0; part < totalParts && ok; part++) {
-    size_t n = f.read(chunk, CHUNK_SIZE);
+    // Card ejected or disconnected mid-upload: stop before touching the
+    // file again, and treat a short read as the same thing - the backend
+    // must never get a truncated part marked final.
+    if (!sdStorageAvailable()) {
+      Serial.println(F("Upload: SD went away - aborting, will retry."));
+      ok = false;
+      break;
+    }
+    size_t expected = (part == totalParts - 1) ? fileSize - part * CHUNK_SIZE : CHUNK_SIZE;
+    size_t n = f.read(chunk, expected);
+    if (n != expected) {
+      Serial.printf("Upload: short read on %s (%u/%u bytes) - aborting, will retry.\n", localPath,
+                    (unsigned)n, (unsigned)expected);
+      ok = false;
+      break;
+    }
 
     char path[192];
     snprintf(path, sizeof(path), "/upload/%s?part=%u&total=%u&final=%d", remoteFilename,

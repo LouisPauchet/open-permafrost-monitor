@@ -90,6 +90,13 @@ bool sdStreamIsOpen(SdStream stream);
 // actual SD write happens later, on the writer task.
 void sdStreamWrite(SdStream stream, const uint8_t *data, size_t len);
 
+// Brackets direct SD reads made outside the writer task (currently only the
+// daily upload, on the modem worker). Such a reader must check
+// sdStorageAvailable() before every read: eject flips it false, then waits
+// (bounded) for active readers to finish before unmounting.
+void sdReaderBegin();
+void sdReaderEnd();
+
 // Total bytes dropped across all streams since boot because a ring buffer
 // was full - should stay 0; anything else means the writer task (i.e. the
 // card) isn't keeping up and data is being lost.

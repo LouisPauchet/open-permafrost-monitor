@@ -3,6 +3,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <USBMSC.h>
+#include <atomic>
 #include <esp_attr.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -47,6 +48,18 @@ static void sdWriterPause();
 // Per-stream bytes dropped because a ring buffer was full (writer task not
 // keeping up, or paused). Shown in main.cpp's [STATUS] line.
 static volatile uint32_t droppedBytes[SD_STREAM_COUNT] = {};
+
+// Readers outside the writer task (the daily upload, on the modem worker)
+// register here so eject can let them finish/abort before SD.end().
+static std::atomic<int> activeReaders{0};
+
+void sdReaderBegin() {
+  activeReaders++;
+}
+
+void sdReaderEnd() {
+  activeReaders--;
+}
 
 bool sdStorageInit() {
   pinMode(SD_POWER_EN_PIN, OUTPUT);
@@ -208,6 +221,17 @@ void sdCheckEjectButton() {
   if (available) {
     Serial.println(F("SD: eject button pressed - flushing and unmounting..."));
     sdStorageCloseAllForReboot();
+    // Readers check sdStorageAvailable() before every chunk - flipping it
+    // first lets an in-progress upload abort and close its file before the
+    // card goes away under it (bounded: one chunk read is well under this).
+    available = false;
+    unsigned long readerWaitStart = millis();
+    while (activeReaders.load() > 0 && millis() - readerWaitStart < 2000) {
+      delay(10);
+    }
+    if (activeReaders.load() > 0) {
+      Serial.println(F("SD: a reader is still busy - unmounting anyway."));
+    }
     sdWriterPause();
     SD.end();
     digitalWrite(SD_POWER_EN_PIN, HIGH); // active LOW enable - HIGH cuts power
