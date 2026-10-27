@@ -3,6 +3,7 @@
 #include <string.h>
 #include "geophone_parse.h"
 #include "geophone_timing.h"
+#include "ubx.h"
 
 void setUp() {}
 void tearDown() {}
@@ -127,6 +128,41 @@ static void test_channel_continuity_and_resync() {
   TEST_ASSERT_TRUE(resynced);
 }
 
+// --- ubx ---
+
+static void test_ubx_checksum_matches_existing_frames() {
+  // Hand-computed frames already in gnss.cpp (verified working on hardware).
+  const uint8_t gst[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x07,
+                         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, 0x59};
+  const uint8_t rawx[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0x02, 0x15,
+                          0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x27, 0x4B};
+  const uint8_t pmreq[] = {0xB5, 0x62, 0x02, 0x41, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                           0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x79, 0xCB};
+  uint8_t a, b;
+  ubxChecksum(gst + 2, sizeof(gst) - 4, &a, &b);
+  TEST_ASSERT_EQUAL_HEX8(0x07, a);
+  TEST_ASSERT_EQUAL_HEX8(0x59, b);
+  ubxChecksum(rawx + 2, sizeof(rawx) - 4, &a, &b);
+  TEST_ASSERT_EQUAL_HEX8(0x27, a);
+  TEST_ASSERT_EQUAL_HEX8(0x4B, b);
+  ubxChecksum(pmreq + 2, sizeof(pmreq) - 4, &a, &b);
+  TEST_ASSERT_EQUAL_HEX8(0x79, a);
+  TEST_ASSERT_EQUAL_HEX8(0xCB, b);
+}
+
+static void test_ubx_build_cfg_msg() {
+  uint8_t frame[UBX_CFG_MSG_FRAME_LEN];
+  ubxBuildCfgMsgUart1(0xF0, 0x07, 1, frame); // must reproduce the GST frame exactly
+  const uint8_t gst[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x07,
+                         0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x07, 0x59};
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(gst, frame, sizeof(gst));
+  ubxBuildCfgMsgUart1(0xF0, 0x03, 0, frame); // GSV off
+  TEST_ASSERT_EQUAL_HEX8(0x03, frame[7]);
+  TEST_ASSERT_EQUAL_HEX8(0x00, frame[9]);
+  TEST_ASSERT_EQUAL_HEX8(0x02, frame[14]); // the commonly published "disable GSV" frame
+  TEST_ASSERT_EQUAL_HEX8(0x38, frame[15]);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_parse_channel_packet);
@@ -139,5 +175,7 @@ int main(int, char **) {
   RUN_TEST(test_clock_steps_on_big_jump);
   RUN_TEST(test_clock_msec_wraps);
   RUN_TEST(test_channel_continuity_and_resync);
+  RUN_TEST(test_ubx_checksum_matches_existing_frames);
+  RUN_TEST(test_ubx_build_cfg_msg);
   return UNITY_END();
 }

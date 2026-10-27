@@ -1,6 +1,7 @@
 #include "gnss.h"
 #include "pins.h"
 #include "sd_storage.h"
+#include "ubx.h"
 #include <TinyGPSPlus.h>
 #include <string.h>
 #include <stdlib.h>
@@ -404,7 +405,32 @@ void gnssEnableRtcm3Input() {
 // fresh UART begin(), so that part is split into gnssReenableMessages().
 static bool uartStarted = false;
 
+// Default-on NMEA sentences nothing here reads: TinyGPS++ only needs GGA
+// (position, fix quality, satellites) and RMC (date), plus GST (accuracy).
+// GSV alone is several long lines per epoch with many satellites tracked.
+// At 38400 baud (wiring is fixed, and changing the F9P's own UART rate
+// would need it persisted to survive backup mode) RAWX + SFRBX + full NMEA
+// comes close to filling the link, and anything that doesn't fit is
+// dropped by the F9P itself - PPK frames included. Rate 0 on UART1 only,
+// RAM layer, so like the other CFG-MSG settings it's resent every wake.
+static const uint8_t NMEA_CLASS = 0xF0;
+static const uint8_t UNUSED_NMEA_IDS[] = {
+    0x01, // GLL
+    0x02, // GSA
+    0x03, // GSV
+    0x05, // VTG
+};
+
+static void gnssDisableUnusedNmea() {
+  uint8_t frame[UBX_CFG_MSG_FRAME_LEN];
+  for (uint8_t id : UNUSED_NMEA_IDS) {
+    ubxBuildCfgMsgUart1(NMEA_CLASS, id, 0, frame);
+    GPSSerial.write(frame, sizeof(frame));
+  }
+}
+
 void gnssReenableMessages() {
+  gnssDisableUnusedNmea();
   gnssEnableGST();
   gnssEnableRtcm3Input();
   GPSSerial.write(UBX_ENABLE_RXM_RTCM_UART1, sizeof(UBX_ENABLE_RXM_RTCM_UART1));
@@ -417,7 +443,10 @@ void gnssReenableMessages() {
 
 void initGNSS() {
   if (!uartStarted) {
-    GPSSerial.setRxBufferSize(1024);
+    // ~1 s at 38400 baud: loopTask can still sit inside a blocking modem
+    // call (socketDial, setOpState) for a while mid-burst, and whatever
+    // overflows here is lost UBX data for PPK.
+    GPSSerial.setRxBufferSize(4096);
     GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     uartStarted = true;
     delay(100);
