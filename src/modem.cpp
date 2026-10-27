@@ -3,6 +3,7 @@
 #include "geophone.h"
 #include "sd_storage.h"
 #include <WalterModem.h>
+#include <Preferences.h>
 #include <esp_attr.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -204,6 +205,59 @@ static void drainSocketRing() {
   }
 }
 
+// --- CA certificate in modem NVM ---
+//
+// Written only when it differs from what this firmware last wrote (tracked
+// by fingerprint in ESP32 NVS), rather than on every boot - reboot-heavy
+// periods otherwise rewrite the modem's flash each time. The modem is
+// soldered to the board, so it can't be swapped behind NVS's back, but a
+// Sequans firmware update or NVM reset could still drop the cert. So a
+// TLS-using job that fails (MQTT connect, HTTPS send) marks the cert
+// suspect, and the next job rewrites it first - at most once per boot, so
+// a station with no coverage doesn't rewrite it every cycle.
+static const char *MODEM_NVS_NAMESPACE = "modem";
+static volatile bool caCertSuspect = false;
+static bool caCertRewrittenThisBoot = false;
+
+static uint32_t caCertFingerprint() {
+  uint32_t h = 2166136261u; // FNV-1a
+  for (const char *p = ISRG_ROOT_X1_CA; *p; p++) {
+    h = (h ^ (uint8_t)*p) * 16777619u;
+  }
+  return (h ^ MODEM_CA_SLOT) * 16777619u;
+}
+
+static void writeCaCertIfNeeded(bool force) {
+  uint32_t fp = caCertFingerprint();
+  Preferences prefs;
+  if (!force) {
+    prefs.begin(MODEM_NVS_NAMESPACE, true);
+    uint32_t stored = prefs.getUInt("ca_fp", 0);
+    prefs.end();
+    if (stored == fp) {
+      return;
+    }
+  }
+  if (!modem.tlsWriteCredential(false, MODEM_CA_SLOT, ISRG_ROOT_X1_CA)) {
+    Serial.println(F("Modem: tlsWriteCredential failed."));
+    return;
+  }
+  Serial.println(F("Modem: CA certificate written."));
+  prefs.begin(MODEM_NVS_NAMESPACE, false);
+  prefs.putUInt("ca_fp", fp);
+  prefs.end();
+}
+
+// Call at the start of every TLS-using modem job (worker task).
+static void rewriteCaCertIfSuspect() {
+  if (caCertSuspect && !caCertRewrittenThisBoot) {
+    caCertRewrittenThisBoot = true;
+    Serial.println(F("Modem: last TLS job failed - rewriting CA certificate once."));
+    writeCaCertIfNeeded(true);
+  }
+  caCertSuspect = false;
+}
+
 static bool isRegistered(WalterModemNetworkRegState state) {
   switch (state) {
     case WALTER_MODEM_NETWORK_REG_REGISTERED_HOME:
@@ -315,10 +369,8 @@ bool modemInit() {
   // One shared CA credential (Let's Encrypt root) covers both the MQTT
   // broker and the upload backend, assuming both present publicly-trusted
   // certs. Written to MODEM_CA_SLOT (10-19 range - see its definition for
-  // why 0-9 doesn't work).
-  if (!modem.tlsWriteCredential(false, MODEM_CA_SLOT, ISRG_ROOT_X1_CA)) {
-    Serial.println(F("Modem: tlsWriteCredential failed."));
-  }
+  // why 0-9 doesn't work) - only when it changed, see writeCaCertIfNeeded().
+  writeCaCertIfNeeded(false);
   WalterModemRsp tlsRsp;
   if (!modem.tlsConfigProfile(MODEM_TLS_PROFILE_MQTT, WALTER_MODEM_TLS_VALIDATION_CA,
                                WALTER_MODEM_TLS_VERSION_12, MODEM_CA_SLOT, 0xff, 0xff, &tlsRsp)) {
@@ -701,6 +753,8 @@ static void mqttEventHandler(WMMQTTEventType event, const WMMQTTEventData *data,
 }
 
 static void mqttBatchJob(void *) {
+  rewriteCaCertIfSuspect();
+
   // WalterModem::mqttConfig only emits username/password when *both*
   // pointers are non-NULL - it won't send a lone username. ThingsBoard's
   // convention (and this deployment's secrets.h) is username-as-token
@@ -718,8 +772,10 @@ static void mqttBatchJob(void *) {
     xSemaphoreTake(mqttConnectDoneSem, 0); // drain any stale pending signal
     if (!modem.mqttConnect(mqttHost, mqttPort, 60)) {
       Serial.println(F("MQTT: connect failed."));
+      caCertSuspect = true;
     } else if (xSemaphoreTake(mqttConnectDoneSem, pdMS_TO_TICKS(10000)) != pdTRUE) {
       Serial.println(F("MQTT: connect timed out waiting for broker confirmation."));
+      caCertSuspect = true;
     } else if (!mqttConnectedOk) {
       Serial.println(F("MQTT: broker rejected the connection."));
     } else if (!modem.mqttPublish(mqttTopic, mqttPayload, mqttPayloadLen, 1)) {
@@ -816,6 +872,8 @@ bool modemHttpPost(const char *host, uint16_t port, const char *path,
     return false;
   }
 
+  rewriteCaCertIfSuspect();
+
   if (!modem.httpConfigProfile(MODEM_HTTP_PROFILE, host, port, MODEM_TLS_PROFILE_HTTP,
                                 true, apiKey, "")) {
     Serial.println(F("Modem: httpConfigProfile failed."));
@@ -825,6 +883,7 @@ bool modemHttpPost(const char *host, uint16_t port, const char *path,
   if (!modem.httpSend(MODEM_HTTP_PROFILE, path, (uint8_t *)body, (uint16_t)bodyLen,
                        WALTER_MODEM_HTTP_SEND_CMD_POST)) {
     Serial.println(F("Modem: httpSend failed."));
+    caCertSuspect = true;
     return false;
   }
   return true;
