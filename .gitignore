@@ -9,3 +9,6 @@ include/secrets.h
 # Written by `pio test -e native`, read by test/obspy_check.py
 steim2_fixture.mseed
 steim2_fixture.txt
+
+# MkDocs build output (mkdocs build)
+site/

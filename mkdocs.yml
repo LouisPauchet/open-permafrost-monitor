@@ -1,0 +1,106 @@
+site_name: Open Permafrost Monitor
+site_description: RTK GNSS + seismic field station on a Walter ESP32-S3 - build, deploy, use the data, change the firmware.
+site_url: https://louispauchet.github.io/open-permafrost-monitor/
+repo_url: https://github.com/LouisPauchet/open-permafrost-monitor
+repo_name: open-permafrost-monitor
+edit_uri: edit/main/docs/
+copyright: Licensed under the EUPL v1.2
+
+# With --strict these turn broken page links and #anchors into build errors.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue grey
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - def_list
+  - footnotes
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Build a station:
+      - build/index.md
+      - Hardware: build/hardware.md
+      - Wiring: build/wiring.md
+      - Enclosure parts: build/enclosure.md
+      - Flash the firmware: build/flashing.md
+      - First boot: build/first-boot.md
+  - Field use:
+      - field/index.md
+      - Configuration menu: field/configuration.md
+      - Commissioning: field/commissioning.md
+      - Deployment checklist: field/deployment-checklist.md
+      - Getting data off: field/data-retrieval.md
+      - Troubleshooting: field/troubleshooting.md
+  - Data:
+      - data/index.md
+      - SD card layout: data/sd-layout.md
+      - MiniSEED (geophone): data/miniseed.md
+      - Positions CSV: data/positions-csv.md
+      - GNSS raw / PPK: data/gnss-raw.md
+      - MQTT telemetry: data/mqtt.md
+      - Upload backend API: data/upload-api.md
+  - How it works:
+      - how-it-works/index.md
+      - Architecture: how-it-works/architecture.md
+      - GNSS fix cycle: how-it-works/scheduler.md
+      - Power management: how-it-works/power.md
+      - Timing: how-it-works/timing.md
+      - Storage: how-it-works/storage.md
+      - Configuration model: how-it-works/configuration-model.md
+      - Raspberry Shake protocol: how-it-works/raspberry-shake.md
+  - Develop:
+      - develop/index.md
+      - Code map: develop/code-map.md
+      - Build and test: develop/building-and-testing.md
+      - WalterModem library: develop/walter-modem.md
+      - Contributing: develop/contributing.md

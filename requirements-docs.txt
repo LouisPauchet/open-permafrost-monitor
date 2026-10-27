@@ -1,0 +1,4 @@
+# Documentation site toolchain - `pip install -r requirements-docs.txt`,
+# then `mkdocs serve` (preview) or `mkdocs build --strict` (CI check).
+mkdocs==1.6.1
+mkdocs-material==9.6.14
