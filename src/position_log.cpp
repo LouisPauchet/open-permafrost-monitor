@@ -16,12 +16,35 @@ static const char *CSV_HEADER = "time,latitude,longitude,altitude,horizontal_acc
                                  "vertical_accuracy,fix_quality,quality_ok,battery_external_v,"
                                  "battery_internal_v,has_displacement,north_m,east_m,up_m,epoch_ms";
 
+// Row time and the daily file's date both come from gnssEpochMillisNow()
+// (extrapolated from the last fresh fix), not TinyGPS++'s date/time fields:
+// those never expire, so a burst in which the F9P never reported a time
+// would have logged - and published to ThingsBoard, which keys rows by ts -
+// the previous burst's timestamp again, overwriting that earlier reading.
+static bool currentCivilTime(char *date, size_t dateSize, char *iso, size_t isoSize,
+                             uint64_t *epochMs) {
+  if (!gnssHasEpochAnchor()) {
+    return false;
+  }
+  *epochMs = gnssEpochMillisNow();
+  uint16_t year, milli;
+  uint8_t month, day, hour, minute, second;
+  gnssCivilFromEpochMillis(*epochMs, &year, &month, &day, &hour, &minute, &second, &milli);
+  if (date) {
+    snprintf(date, dateSize, "%04u%02u%02u", year, month, day);
+  }
+  if (iso) {
+    snprintf(iso, isoSize, "%04u-%02u-%02uT%02u:%02u:%02uZ", year, month, day, hour, minute, second);
+  }
+  return true;
+}
+
 static void rotateIfNeeded() {
-  if (!gnssHasDateTime()) {
+  char today[9];
+  uint64_t epochMs;
+  if (!currentCivilTime(today, sizeof(today), nullptr, 0, &epochMs)) {
     return;
   }
-  char today[9];
-  gnssDateString(today, sizeof(today));
   if (strcmp(today, currentDate) == 0) {
     // Already rotated to today - but if the open never actually landed
     // (e.g. a transient SD hiccup right at rotation, seen on live hardware
@@ -64,9 +87,8 @@ void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInte
   }
 
   char ts[25] = "";
-  if (gnssHasDateTime()) {
-    gnssTimestamp(ts, sizeof(ts));
-  }
+  uint64_t epochMs = 0;
+  currentCivilTime(nullptr, 0, ts, sizeof(ts), &epochMs);
 
   char row[256];
   int len = snprintf(
@@ -77,7 +99,7 @@ void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInte
       qualityOk ? "true" : "false", batteryExternalV, batteryInternalV,
       hasDisplacement ? "true" : "false", hasDisplacement ? northM : 0.0f,
       hasDisplacement ? eastM : 0.0f, hasDisplacement ? upM : 0.0f,
-      gnssHasDateTime() ? (unsigned long long)gnssEpochMillis() : 0ULL);
+      (unsigned long long)epochMs);
   if (len <= 0) {
     return;
   }
@@ -102,6 +124,8 @@ void positionLogAppend(bool qualityOk, float batteryExternalV, float batteryInte
 // visible yet - it can still be sitting in the writer task's ring buffer
 // or its 50ms drain cycle hasn't run - but it's never lost, just picked up
 // on the next call via sentOffset, so this only affects freshness.
+// sentOffset lives in RAM only, so after a reboot the day's rows are
+// published again - harmless, since ThingsBoard keys each row by its ts.
 size_t positionLogReadUnsent(char *buf, size_t bufSize) {
   if (!sdStorageAvailable() || currentPath[0] == '\0') {
     return 0;
